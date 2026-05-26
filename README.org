@@ -16,9 +16,14 @@ Each agent-shell buffer maps to one grid key:
 - Pulsing LED :: agent is busy (varies in brightness while working).
 - Bright LED :: agent is blocked waiting for input (permission prompt).
 
-Tapping a lit key jumps to that buffer.  Pressing an *unlit* key
-spawns a new agent-shell.  If the pressed column already belongs to a
-project, the new shell is rooted there, so an empty press stacks into
+Tapping a lit key jumps to that buffer.  Tapping the key of the buffer
+that is *already* open sends an ENTER to it (submits the current
+prompt), so a re-tap doubles as "send" - handy after dictating with
+hold-to-talk.  Disable via ~agent-shell-monome-tap-open-sends-enter~.
+
+Pressing an *unlit* key spawns a new agent-shell.  If the pressed
+column already belongs to a project, the new shell is rooted there, so
+an empty press stacks into
 that column's project; an empty column with no project yet falls back
 to the project of the currently selected buffer (or its
 ~default-directory~).  Disable via

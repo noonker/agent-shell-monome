@@ -213,6 +213,15 @@ The new shell is started in the project of the currently selected
 window's buffer, falling back to its `default-directory'."
   :type 'boolean)
 
+(defcustom agent-shell-monome-tap-open-sends-enter t
+  "When non-nil, tapping the already-open buffer's grid key submits it.
+A tap on the key of the buffer that is already showing in the selected
+window sends an ENTER to that shell (via `shell-maker-submit'), turning a
+re-tap into \"submit the current prompt\".  Taps on any other key keep
+their meaning of switching to that buffer; holding a key still records
+voice (see `agent-shell-monome-hold-to-talk')."
+  :type 'boolean)
+
 (defcustom agent-shell-monome-hold-to-talk t
   "When non-nil, holding a bound grid key records voice for that shell.
 Press and hold a key mapped to an `agent-shell' buffer; once held past
@@ -287,6 +296,13 @@ Top-level keys:
                           ring 3 answers the head.  Each entry is an alist
                           of :respond :allow-id :reject-id :tool-call.
   :saved-responder      - Previous `agent-shell-permission-responder-function'.
+
+  ;; Grid tap-to-submit
+  :tap-coord            - (X . Y) of the key pressed down, matched on
+                          release to resolve the tap/hold gesture.
+  :tap-reopen           - Buffer to submit (send ENTER) if the gesture
+                          resolves to a tap, set only when the pressed key
+                          is the already-open buffer's; nil otherwise.
 
   ;; Hold-to-talk (voice input via whisper)
   :htt-down-coord       - (X . Y) of the key whose hold gesture is active,
@@ -640,12 +656,21 @@ project when COL is nil or owns no project yet."
   "Handle a grid key press at (X, Y).
 Switches to (or spawns) the buffer at that coordinate as before, and --
 for a bound, live buffer -- arms the hold-to-talk timer so a sustained
-hold begins recording."
+hold begins recording.  It also records whether the key belongs to the
+already-open buffer so a tap (resolved on release) can submit an ENTER
+to it."
   (let ((buffer (alist-get (cons x y)
                            (alist-get :bindings agent-shell-monome--state)
                            nil nil #'equal)))
     (cond
      ((and buffer (buffer-live-p buffer))
+      ;; Note "is this the open buffer?" *before* switching to it, so a tap
+      ;; on its own key can submit rather than be a no-op re-switch.
+      (setf (alist-get :tap-coord agent-shell-monome--state) (cons x y))
+      (setf (alist-get :tap-reopen agent-shell-monome--state)
+            (and agent-shell-monome-tap-open-sends-enter
+                 (eq buffer (window-buffer (selected-window)))
+                 buffer))
       (pop-to-buffer buffer)
       (agent-shell-monome--maybe-arm-hold (cons x y) buffer))
      (buffer
@@ -655,20 +680,41 @@ hold begins recording."
 
 (defun agent-shell-monome--on-grid-key-up (x y)
   "Handle a grid key release at (X, Y).
-Resolves the hold-to-talk gesture armed on key-down: a release before
-the threshold is a tap (the buffer switch already happened, nothing more
-to do); a release after it stops the in-progress recording, which
-triggers transcription and insertion."
-  (when (equal (cons x y)
-               (alist-get :htt-down-coord agent-shell-monome--state))
-    (if-let ((timer (alist-get :htt-timer agent-shell-monome--state)))
-        ;; Released before the threshold: a tap.  Recording never began.
-        (progn
-          (cancel-timer timer)
-          (setf (alist-get :htt-timer agent-shell-monome--state) nil)
-          (setf (alist-get :htt-down-coord agent-shell-monome--state) nil))
-      ;; Held past the threshold: recording is running -- stop it.
-      (agent-shell-monome--htt-end))))
+Resolves the gesture armed on key-down.  A hold past the threshold stops
+the in-progress hold-to-talk recording, triggering transcription and
+insertion.  A tap that began on the already-open buffer's own key submits
+an ENTER to it (see `agent-shell-monome-tap-open-sends-enter'); any other
+tap is just the buffer switch that already happened on key-down."
+  (let ((coord (cons x y))
+        ;; Capture before `--htt-end' clears it: a recording in flight means
+        ;; this release is a hold, not a tap, so it must not also submit.
+        (was-recording (alist-get :htt-recording agent-shell-monome--state)))
+    (when (equal coord (alist-get :htt-down-coord agent-shell-monome--state))
+      (if-let ((timer (alist-get :htt-timer agent-shell-monome--state)))
+          ;; Released before the threshold: a tap.  Recording never began.
+          (progn
+            (cancel-timer timer)
+            (setf (alist-get :htt-timer agent-shell-monome--state) nil)
+            (setf (alist-get :htt-down-coord agent-shell-monome--state) nil))
+        ;; Held past the threshold: recording is running -- stop it.
+        (agent-shell-monome--htt-end)))
+    (when (equal coord (alist-get :tap-coord agent-shell-monome--state))
+      (let ((reopen (alist-get :tap-reopen agent-shell-monome--state)))
+        (setf (alist-get :tap-coord agent-shell-monome--state) nil)
+        (setf (alist-get :tap-reopen agent-shell-monome--state) nil)
+        ;; A tap (not a hold) on the buffer that was already open submits it.
+        (when (and reopen (not was-recording) (buffer-live-p reopen))
+          (agent-shell-monome--send-enter reopen))))))
+
+(defun agent-shell-monome--send-enter (buffer)
+  "Submit BUFFER's current prompt input, as if RET were pressed there.
+Goes through `shell-maker-submit', the same submit path hold-to-talk
+uses.  Errors are swallowed since this runs from the OSC process filter."
+  (when (and (buffer-live-p buffer) (fboundp 'shell-maker-submit))
+    (with-current-buffer buffer
+      (condition-case err
+          (shell-maker-submit)
+        (error (message "agent-shell-monome: send ENTER failed: %S" err))))))
 
 (defun agent-shell-monome--maybe-arm-hold (coord buffer)
   "Arm the hold-to-talk timer for COORD targeting BUFFER.
@@ -1504,6 +1550,9 @@ live mic is unmistakable; every other key reflects its buffer status."
                 ;; Permissions
                 (cons :pending-permissions nil)
                 (cons :saved-responder agent-shell-permission-responder-function)
+                ;; Grid tap-to-submit
+                (cons :tap-coord nil)
+                (cons :tap-reopen nil)
                 ;; Hold-to-talk
                 (cons :htt-down-coord nil)
                 (cons :htt-timer nil)

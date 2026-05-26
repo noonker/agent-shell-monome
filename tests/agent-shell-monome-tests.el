@@ -583,6 +583,117 @@
             ((symbol-function 'get-buffer-window) (lambda (&rest _) 'bg-win)))
     (should (eq 'bg-win (agent-shell-monome--scroll-target-window 'buf)))))
 
+;;;; Grid tap-on-open sends ENTER
+
+(ert-deftest agent-shell-monome--tap-on-open-buffer-sends-enter ()
+  ;; Tapping the key of the buffer that is already open submits it (ENTER)
+  ;; on release, rather than being a no-op re-switch.
+  (let* ((buf (generate-new-buffer " *tap-enter*"))
+         (agent-shell-monome--state
+          (list (cons :bindings (list (cons (cons 2 3) buf)))
+                (cons :tap-coord nil) (cons :tap-reopen nil)
+                (cons :htt-down-coord nil) (cons :htt-timer nil)
+                (cons :htt-recording nil)))
+         (agent-shell-monome-tap-open-sends-enter t)
+         (agent-shell-monome-hold-to-talk nil)
+         (submitted 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer) (lambda (&rest _) nil))
+                  ((symbol-function 'selected-window) (lambda () 'win))
+                  ((symbol-function 'window-buffer) (lambda (_) buf))
+                  ((symbol-function 'shell-maker-submit)
+                   (lambda (&rest _) (setq submitted (1+ submitted)))))
+          (agent-shell-monome--on-grid-key 2 3 1) ; press
+          (should (equal '(2 . 3) (alist-get :tap-coord agent-shell-monome--state)))
+          (should (eq buf (alist-get :tap-reopen agent-shell-monome--state)))
+          (should (= 0 submitted))      ; nothing on press
+          (agent-shell-monome--on-grid-key 2 3 0) ; release -> submit
+          (should (= 1 submitted))
+          (should-not (alist-get :tap-coord agent-shell-monome--state))
+          (should-not (alist-get :tap-reopen agent-shell-monome--state)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-monome--tap-on-unfocused-buffer-just-switches ()
+  ;; Tapping a key whose buffer is NOT the open one only switches -- the
+  ;; ENTER gesture is reserved for re-tapping the already-open buffer.
+  (let* ((buf (generate-new-buffer " *tap-switch*"))
+         (other (generate-new-buffer " *open-elsewhere*"))
+         (agent-shell-monome--state
+          (list (cons :bindings (list (cons (cons 0 0) buf)))
+                (cons :tap-coord nil) (cons :tap-reopen nil)
+                (cons :htt-down-coord nil) (cons :htt-timer nil)
+                (cons :htt-recording nil)))
+         (agent-shell-monome-tap-open-sends-enter t)
+         (agent-shell-monome-hold-to-talk nil)
+         (submitted 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer) (lambda (&rest _) nil))
+                  ((symbol-function 'selected-window) (lambda () 'win))
+                  ((symbol-function 'window-buffer) (lambda (_) other))
+                  ((symbol-function 'shell-maker-submit)
+                   (lambda (&rest _) (setq submitted (1+ submitted)))))
+          (agent-shell-monome--on-grid-key 0 0 1)
+          (should-not (alist-get :tap-reopen agent-shell-monome--state))
+          (agent-shell-monome--on-grid-key 0 0 0)
+          (should (= 0 submitted)))
+      (kill-buffer buf)
+      (kill-buffer other))))
+
+(ert-deftest agent-shell-monome--tap-open-disabled-sends-nothing ()
+  ;; With the option off, re-tapping the open buffer stays a plain switch.
+  (let* ((buf (generate-new-buffer " *tap-disabled*"))
+         (agent-shell-monome--state
+          (list (cons :bindings (list (cons (cons 0 0) buf)))
+                (cons :tap-coord nil) (cons :tap-reopen nil)
+                (cons :htt-down-coord nil) (cons :htt-timer nil)
+                (cons :htt-recording nil)))
+         (agent-shell-monome-tap-open-sends-enter nil)
+         (agent-shell-monome-hold-to-talk nil)
+         (submitted 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer) (lambda (&rest _) nil))
+                  ((symbol-function 'selected-window) (lambda () 'win))
+                  ((symbol-function 'window-buffer) (lambda (_) buf))
+                  ((symbol-function 'shell-maker-submit)
+                   (lambda (&rest _) (setq submitted (1+ submitted)))))
+          (agent-shell-monome--on-grid-key 0 0 1)
+          (should-not (alist-get :tap-reopen agent-shell-monome--state))
+          (agent-shell-monome--on-grid-key 0 0 0)
+          (should (= 0 submitted)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-monome--hold-on-open-buffer-records-not-submits ()
+  ;; Holding the open buffer's key records voice as usual; the release must
+  ;; finish transcription and NOT also fire the tap-to-submit ENTER.
+  (let* ((buf (generate-new-buffer " *tap-hold*"))
+         (agent-shell-monome--state
+          (list (cons :bindings (list (cons (cons 0 0) buf)))
+                (cons :tap-coord nil) (cons :tap-reopen nil)
+                (cons :htt-down-coord nil) (cons :htt-timer nil)
+                (cons :htt-recording nil) (cons :htt-target nil)))
+         (agent-shell-monome-tap-open-sends-enter t)
+         (agent-shell-monome-hold-to-talk t)
+         (recording nil)
+         (submitted 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer) (lambda (&rest _) nil))
+                  ((symbol-function 'selected-window) (lambda () 'win))
+                  ((symbol-function 'window-buffer) (lambda (_) buf))
+                  ((symbol-function 'run-at-time) (lambda (&rest _) 'fake-timer))
+                  ((symbol-function 'cancel-timer) (lambda (_) nil))
+                  ((symbol-function 'whisper-run) (lambda (&rest _) nil))
+                  ((symbol-function 'whisper-recording-p) (lambda () recording))
+                  ((symbol-function 'whisper-transcribing-p) (lambda () nil))
+                  ((symbol-function 'shell-maker-submit)
+                   (lambda (&rest _) (setq submitted (1+ submitted)))))
+          (agent-shell-monome--on-grid-key 0 0 1) ; press open buffer's key
+          (should (eq buf (alist-get :tap-reopen agent-shell-monome--state)))
+          (agent-shell-monome--htt-begin buf)     ; hold threshold passes
+          (setq recording t)
+          (agent-shell-monome--on-grid-key 0 0 0) ; release while recording
+          (should (= 0 submitted)))               ; transcribed, not submitted
+      (kill-buffer buf))))
+
 ;;;; Ring 4 token-rate spinner
 
 (ert-deftest agent-shell-monome--spinner-parked-when-idle ()
