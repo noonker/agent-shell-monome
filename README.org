@@ -1,0 +1,151 @@
+#+TITLE: agent-shell-monome
+
+Monitor and control [[https://github.com/xenodium/agent-shell][agent-shell]] sessions from a [[https://monome.org][monome grid]] and/or
+[[https://monome.org][monome arc]] via [[https://monome.org/docs/serialosc/][serialosc]].
+
+* Grid
+
+Buffers belonging to the same project are stacked in the same column.
+Each project is assigned the lowest free column on first appearance
+(stable until its last buffer is killed); within a column, buffers
+stack from the top down in insertion order and leave gaps when killed.
+
+Each agent-shell buffer maps to one grid key:
+
+- Dim LED :: buffer exists, agent is idle.
+- Pulsing LED :: agent is busy (varies in brightness while working).
+- Bright LED :: agent is blocked waiting for input (permission prompt).
+
+Tapping a lit key jumps to that buffer.  Pressing an *unlit* key
+spawns a new agent-shell, rooted at the project of whichever buffer
+is currently selected (falling back to its ~default-directory~).
+Disable via ~agent-shell-monome-spawn-on-empty-press~.
+
+** Hold to talk (voice input)
+
+*Hold* a lit key to dictate into that buffer's session.  Once held past
+~agent-shell-monome-hold-threshold~ (0.3s by default) the bridge starts
+recording audio; the key blinks while the mic is live.  Release to stop:
+the recording is transcribed and inserted at that shell's prompt, ready
+for you to review and send.  A quick tap still just switches buffers.
+
+This uses the [[https://github.com/natrys/whisper.el][whisper.el]] package for recording and transcription, so
+whisper must be installed and configured (local whisper.cpp, a whisper
+server, or the OpenAI backend - see its README).  Without it, holding a
+key degrades to a plain tap.
+
+- ~agent-shell-monome-hold-to-talk~ :: master switch (on by default).
+- ~agent-shell-monome-hold-threshold~ :: seconds to hold before recording
+  begins.  Audio spoken during this window is not captured, so keep it
+  small.
+- ~agent-shell-monome-hold-to-talk-submit~ :: when non-nil, send the
+  transcription immediately (via ~shell-maker-submit~) instead of leaving
+  it at the prompt for you to edit and send.
+
+* Arc
+
+Uses up to the first four encoders.
+
+** Ring 1 - buffer selector
+
+- One indicator LED per agent-shell buffer at evenly-spaced positions.
+- Each indicator's brightness reflects that buffer's status (same
+  scheme as the grid).
+- A brighter three-LED wedge marks the currently selected buffer.
+- Turning snaps to the nearest buffer.
+
+** Ring 2 - scroll
+
+Turning scrolls the selected buffer up/down.  A bright wedge on the
+ring tracks the window-start position relative to the buffer.
+
+** Ring 3 - yes/no decision
+
+Turning past a threshold in either direction answers the selected
+buffer's pending permission prompt:
+
+- Right (clockwise) past threshold :: ~allow_once~
+- Left (counter-clockwise) past threshold :: ~reject_once~
+
+A small dead-zone absorbs jitter.  The accumulator decays toward zero
+between ticks so you have to commit deliberately.
+
+While idle the ring shows two small marker LEDs at 12 and 6 o'clock
+when a permission is armed.  As you turn, the half-ring on that side
+fills in proportion to how close you are to threshold.
+
+** Ring 4 - token rate (and effort)
+
+Visual fill proportional to the rolling token rate (tokens/second
+summed across all known agent-shell buffers, averaged over a 60-second
+window by default).
+
+When the selected buffer's agent advertises a ~thought_level~ config
+option, turning the encoder also steps the level up (clockwise) or
+down (counter-clockwise) for that buffer.  The current level is shown
+as a brighter LED at one of N positions around the ring.
+
+* Requirements
+
+- Emacs 28+
+- [[https://github.com/xenodium/agent-shell][agent-shell]]
+- ~serialosc~ running locally (default port ~12002~)
+- A monome grid and/or arc connected
+- (optional) [[https://github.com/natrys/whisper.el][whisper.el]] - for grid hold-to-talk voice input
+
+* Install
+
+#+begin_src emacs-lisp
+  (add-to-list 'load-path "~/git/agent-shell-monome")
+  (require 'agent-shell-monome)
+#+end_src
+
+* Usage
+
+#+begin_src emacs-lisp
+  M-x agent-shell-monome-start
+  M-x agent-shell-monome-stop
+#+end_src
+
+On start, ~agent-shell-monome~ binds a local UDP listener, queries
+~serialosc~ for attached devices, and configures any grid/arc it
+finds.  Both kinds of device are optional - run with just a grid, just
+an arc, or both.
+
+* Customization
+
+See ~M-x customize-group RET agent-shell-monome RET~ for the full
+list.  Highlights:
+
+- ~agent-shell-monome-tick-seconds~ - LED refresh interval.
+- ~agent-shell-monome-hold-to-talk~ - grid hold-to-talk voice input
+  (see the Grid section for the full set of options).
+- ~agent-shell-monome-arc-decision-threshold~ - encoder ticks required
+  to commit a yes/no decision (larger = harder to trigger accidentally).
+- ~agent-shell-monome-arc-tokens-window-seconds~ - moving-window length
+  used for the token-rate calculation.
+- ~agent-shell-monome-arc-tokens-max-rate~ - rate at which ring 4
+  saturates (tokens/second).
+- ~agent-shell-monome-arc-selector-encoder~,
+  ~agent-shell-monome-arc-scroll-encoder~,
+  ~agent-shell-monome-arc-decision-encoder~,
+  ~agent-shell-monome-arc-tokens-encoder~ - remap which physical
+  encoder drives which behavior.
+
+* Caveats
+
+- ~agent-shell-monome~ takes over ~agent-shell-permission-responder-function~
+  while running, chaining to any previously-installed responder.  The
+  previous value is restored on stop.
+- Ring 4's effort-control path uses internal ~agent-shell~ symbols and
+  is best-effort: if the agent doesn't expose a ~thought_level~ option,
+  turning ring 4 only updates the visualization.
+- Hold-to-talk drives ~whisper.el~'s single global recorder, so only one
+  key records at a time and it shares state with any other use of
+  ~whisper-run~.
+- One grid and one arc are assumed; multiple devices of the same kind
+  are not yet disambiguated.
+
+* Status
+
+Early/experimental.  PRs welcome.

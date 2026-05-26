@@ -1,0 +1,6 @@
+*.elc
+*~
+\#*\#
+.\#*
+/.dir-locals.el
+/.agent-shell/
