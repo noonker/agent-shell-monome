@@ -247,18 +247,24 @@
           (should (equal '(1 . 0) (car (rassq 'c bindings))))
           (should (equal '(0 . 2) (car (rassq 'd bindings)))))))))
 
-(ert-deftest agent-shell-monome--tokens-rate ()
-  ;; History entries within the window contribute; older are pruned.
-  (let* ((now (float-time))
-         (agent-shell-monome--state
-          (list (cons :tokens-history
-                      (list (cons now 100)
-                            (cons (- now 5) 50)
-                            (cons (- now 1000) 9999)))))
-         (agent-shell-monome-arc-tokens-window-seconds 60.0))
-    (agent-shell-monome--prune-tokens-history)
-    ;; 150 tokens over 60 sec window = 2.5/sec
-    (should (< (abs (- 2.5 (agent-shell-monome--tokens-rate))) 0.01))))
+(ert-deftest agent-shell-monome--flywheel-spins-up-with-tokens ()
+  ;; A burst kicks angular velocity up by its share of a full-speed burst,
+  ;; successive bursts accumulate, and a burst past full speed saturates
+  ;; rather than overspinning.
+  (let ((agent-shell-monome--state (list (cons :tokens-spinner-velocity 0.0)))
+        (agent-shell-monome-arc-tokens-spinner-max-rps 1.0)
+        (agent-shell-monome-arc-tokens-spinner-spinup-tokens 1000.0))
+    (agent-shell-monome--spin-up-flywheel 250)
+    (should (< (abs (- 0.25 (alist-get :tokens-spinner-velocity
+                                       agent-shell-monome--state)))
+               0.001))
+    (agent-shell-monome--spin-up-flywheel 250)
+    (should (< (abs (- 0.5 (alist-get :tokens-spinner-velocity
+                                      agent-shell-monome--state)))
+               0.001))
+    (agent-shell-monome--spin-up-flywheel 9000)
+    (should (= 1.0 (alist-get :tokens-spinner-velocity
+                              agent-shell-monome--state)))))
 
 (ert-deftest agent-shell-monome--ring-map-message-shape ()
   ;; A ring is drawn with one /ring/map carrying the ring number plus 64
@@ -694,30 +700,33 @@
           (should (= 0 submitted)))               ; transcribed, not submitted
       (kill-buffer buf))))
 
-;;;; Ring 4 token-rate spinner
+;;;; Ring 4 token-momentum flywheel
 
-(ert-deftest agent-shell-monome--spinner-parked-when-idle ()
-  ;; Zero saturation (no tokens) leaves the spinner head where it is.
-  (let ((agent-shell-monome--state (list (cons :tokens-spinner-phase 12.0)))
+(ert-deftest agent-shell-monome--flywheel-coasts-and-advances ()
+  ;; With no fresh tokens the velocity halves every half-life of seconds and
+  ;; the head phase advances by that velocity (rev/s * 64 * tick-seconds).
+  (let ((agent-shell-monome--state (list (cons :tokens-spinner-velocity 1.0)
+                                         (cons :tokens-spinner-phase 0.0)))
         (agent-shell-monome-arc-tokens-spinner-max-rps 1.0)
+        (agent-shell-monome-arc-tokens-spinner-halflife 0.1)
         (agent-shell-monome-tick-seconds 0.1))
-    (should (= 12.0 (agent-shell-monome--advance-spinner-phase 0.0)))
-    (should (= 12.0 (agent-shell-monome--advance-spinner-phase 0.0)))))
+    ;; One tick == one half-life: velocity 1.0 -> 0.5.
+    (should (< (abs (- 0.5 (agent-shell-monome--coast-flywheel))) 0.001))
+    ;; Phase advanced by 0.5 rev * 64 * 0.1s = 3.2 LEDs.
+    (should (< (abs (- 3.2 (alist-get :tokens-spinner-phase
+                                      agent-shell-monome--state)))
+               0.001))))
 
-(ert-deftest agent-shell-monome--spinner-speed-scales-and-wraps ()
-  ;; Advance per tick is max-rps * 64 * tick-seconds * saturation, kept as a
-  ;; float phase in [0, 64).  Here: 1 rev/s * 64 * 0.25s = 16 LEDs/tick at
-  ;; full saturation.
-  (let ((agent-shell-monome--state (list (cons :tokens-spinner-phase 0.0)))
-        (agent-shell-monome-arc-tokens-spinner-max-rps 1.0)
-        (agent-shell-monome-tick-seconds 0.25))
-    (should (= 16.0 (agent-shell-monome--advance-spinner-phase 1.0)))
-    (should (= 32.0 (agent-shell-monome--advance-spinner-phase 1.0)))
-    (should (= 48.0 (agent-shell-monome--advance-spinner-phase 1.0)))
-    ;; 48 + 16 = 64 wraps back to 0.
-    (should (= 0.0 (agent-shell-monome--advance-spinner-phase 1.0)))
-    ;; Half the rate advances half as fast.
-    (should (= 8.0 (agent-shell-monome--advance-spinner-phase 0.5)))))
+(ert-deftest agent-shell-monome--flywheel-parks-when-too-slow ()
+  ;; Velocity too small to move the head half an LED in one tick (the floor
+  ;; at tick 0.1s is ~0.078 rev/s) snaps to zero and the head holds still.
+  (let ((agent-shell-monome--state (list (cons :tokens-spinner-velocity 0.05)
+                                         (cons :tokens-spinner-phase 12.0)))
+        (agent-shell-monome-arc-tokens-spinner-halflife 100.0)
+        (agent-shell-monome-tick-seconds 0.1))
+    (should (= 0.0 (agent-shell-monome--coast-flywheel)))
+    (should (= 12.0 (alist-get :tokens-spinner-phase
+                               agent-shell-monome--state)))))
 
 (provide 'agent-shell-monome-tests)
 ;;; agent-shell-monome-tests.el ends here

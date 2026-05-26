@@ -167,21 +167,34 @@ Gives a freshly started daemon time to bind its discovery port."
   "Encoder index used to display token rate / change effort (ring 4)."
   :type 'integer)
 
-(defcustom agent-shell-monome-arc-tokens-window-seconds 60.0
-  "Seconds of token deltas retained to compute the rolling token rate."
+(defcustom agent-shell-monome-arc-tokens-spinner-spinup-tokens 12000.0
+  "Tokens that spin the ring 4 flywheel from rest to full speed.
+Ring 4 behaves like a flywheel: each turn's token usage gives the wedge
+an angular kick (see `agent-shell-monome--spin-up-flywheel'), and
+friction winds it back down (`agent-shell-monome--coast-flywheel').  A
+burst this large takes it from a standstill to
+`agent-shell-monome-arc-tokens-spinner-max-rps'; smaller bursts add
+proportionally less, so bursty traffic accumulates into speed.  Lower =
+twitchier; higher = needs sustained flow to wind up."
   :type 'number)
 
-(defcustom agent-shell-monome-arc-tokens-max-rate 200.0
-  "Token rate (tokens/sec) at which the ring 4 spinner reaches full speed."
+(defcustom agent-shell-monome-arc-tokens-spinner-halflife 10.0
+  "Seconds for the idle ring 4 flywheel to coast to half speed.
+With no fresh tokens the wedge's angular velocity decays exponentially,
+halving every this many seconds, until it is too slow to move a visible
+LED and parks.  Independent of `agent-shell-monome-tick-seconds'.
+Larger = heavier wheel that keeps spinning longer after a burst."
   :type 'number)
 
 (defcustom agent-shell-monome-arc-tokens-spinner-max-rps 1.0
-  "Ring 4 spinner speed, in revolutions per second, at the max token rate.
-Ring 4 shows token throughput as a wedge rotating around the ring: it
-sits still when idle and spins this fast once the rolling token rate
-reaches `agent-shell-monome-arc-tokens-max-rate', scaling linearly in
-between.  Expressed per second, so it is independent of
-`agent-shell-monome-tick-seconds'."
+  "Top speed of the ring 4 flywheel, in revolutions per second.
+The token flywheel saturates here no matter how many tokens pile in, so
+the comet never spins faster than the eye (or the arc's refresh) can
+follow.  Expressed per second, so it is independent of
+`agent-shell-monome-tick-seconds'.  See
+`agent-shell-monome-arc-tokens-spinner-spinup-tokens' for how it winds
+up and `agent-shell-monome-arc-tokens-spinner-halflife' for how it winds
+down."
   :type 'number)
 
 (defcustom agent-shell-monome-arc-effort-ticks-per-step 32
@@ -287,8 +300,10 @@ Top-level keys:
   :selected-index       - Index into (agent-shell-buffers) selected by ring 1.
   :scroll-accumulator   - Accumulated delta for ring 2.
   :decision-accumulator - Accumulated delta for ring 3.
+  :tokens-spinner-velocity - Ring 4 flywheel angular velocity in rev/sec;
+                          tokens spin it up, friction winds it down.
   :tokens-spinner-phase - Ring 4 spinner head position, a float in [0, 64),
-                          advanced each tick at a token-rate-scaled speed.
+                          advanced each tick by :tokens-spinner-velocity.
   :last-ring-leds       - Alist of ((N . X) . LEVEL) of last sent ring LED.
 
   ;; Permissions
@@ -1279,11 +1294,11 @@ return value."
                ((functionp prev)))
       (funcall prev permission))))
 
-;;; Arc: ring 4 (token rate + effort control)
+;;; Arc: ring 4 (token momentum + effort control)
 ;;
-;; The wheel displays token usage rate across all known agent-shell
-;; buffers (visual output), and -- when the agent advertises a
-;; thought_level config option -- turning it nudges the selected
+;; The wheel is a flywheel spun by token usage across all known
+;; agent-shell buffers (visual output), and -- when the agent advertises
+;; a thought_level config option -- turning it nudges the selected
 ;; buffer's effort level up or down (input).
 
 (defun agent-shell-monome--ensure-tokens-subscribed (buffer)
@@ -1304,7 +1319,9 @@ return value."
         (setf (alist-get :tokens-subscriptions agent-shell-monome--state) subs)))))
 
 (defun agent-shell-monome--on-turn-complete (buffer event)
-  "Record token delta from a turn-complete EVENT on BUFFER."
+  "Spin the ring 4 flywheel by BUFFER's token delta from a turn-complete EVENT.
+`:total-tokens' is cumulative, so the per-turn delta is what just flowed;
+that burst is handed to `agent-shell-monome--spin-up-flywheel'."
   (let* ((data (alist-get :data event))
          (usage (alist-get :usage data))
          (total (or (alist-get :total-tokens usage) 0))
@@ -1312,27 +1329,29 @@ return value."
                                  agent-shell-monome--state))
          (last (or (alist-get buffer last-totals) 0))
          (delta (max 0 (- total last))))
-    (when (> delta 0)
-      (push (cons (float-time) delta)
-            (alist-get :tokens-history agent-shell-monome--state)))
+    (agent-shell-monome--spin-up-flywheel delta)
     (setf (alist-get buffer last-totals) total)
     (setf (alist-get :tokens-last-totals agent-shell-monome--state)
           last-totals)))
 
-(defun agent-shell-monome--prune-tokens-history ()
-  "Drop history entries older than the moving window."
-  (let* ((now (float-time))
-         (cutoff (- now agent-shell-monome-arc-tokens-window-seconds))
-         (history (alist-get :tokens-history agent-shell-monome--state)))
-    (setf (alist-get :tokens-history agent-shell-monome--state)
-          (seq-filter (lambda (entry) (>= (car entry) cutoff)) history))))
-
-(defun agent-shell-monome--tokens-rate ()
-  "Return current token rate (tokens/second) over the moving window."
-  (let* ((history (alist-get :tokens-history agent-shell-monome--state))
-         (sum (seq-reduce #'+ (mapcar #'cdr history) 0))
-         (window agent-shell-monome-arc-tokens-window-seconds))
-    (/ (float sum) (max 1.0 window))))
+(defun agent-shell-monome--spin-up-flywheel (tokens)
+  "Give the ring 4 flywheel an angular kick for TOKENS freshly produced.
+Velocity rises by TOKENS' share of a full
+`agent-shell-monome-arc-tokens-spinner-spinup-tokens' burst, saturating
+at `agent-shell-monome-arc-tokens-spinner-max-rps'.  Friction in
+`agent-shell-monome--coast-flywheel' bleeds it back off, so repeated
+bursts read as a wheel that keeps spinning and winds down gradually
+rather than a windowed average."
+  (when (> tokens 0)
+    (let* ((max-rps agent-shell-monome-arc-tokens-spinner-max-rps)
+           (spinup (max 1.0 agent-shell-monome-arc-tokens-spinner-spinup-tokens))
+           (kick (* max-rps (/ (float tokens) spinup)))
+           (velocity (+ (or (alist-get :tokens-spinner-velocity
+                                       agent-shell-monome--state)
+                            0.0)
+                        kick)))
+      (setf (alist-get :tokens-spinner-velocity agent-shell-monome--state)
+            (min max-rps velocity)))))
 
 (defun agent-shell-monome--effort-info ()
   "Return (LEVELS CURRENT-INDEX) for the selected buffer, or nil.
@@ -1378,44 +1397,59 @@ level in LEVELS."
                                 err))))))))
     (setf (alist-get :effort-accumulator agent-shell-monome--state) acc)))
 
-(defun agent-shell-monome--advance-spinner-phase (saturation)
-  "Advance and return the ring 4 spinner head position for this tick.
-Speed scales with SATURATION (the token rate as a fraction in [0, 1] of
-`agent-shell-monome-arc-tokens-max-rate'): a saturation of 0 parks the
-wedge, 1 spins it at `agent-shell-monome-arc-tokens-spinner-max-rps'
-revolutions per second.  The phase is kept as a float in [0, 64) so slow
-speeds accumulate instead of rounding away to a standstill."
-  (let* ((rps (* agent-shell-monome-arc-tokens-spinner-max-rps saturation))
-         (advance (* rps 64.0 agent-shell-monome-tick-seconds))
+(defun agent-shell-monome--coast-flywheel ()
+  "Wind the ring 4 flywheel down by one tick of friction; return its speed.
+Called once per render tick.  The angular velocity (rev/sec) decays
+exponentially with a half-life of
+`agent-shell-monome-arc-tokens-spinner-halflife' seconds -- independent
+of `agent-shell-monome-tick-seconds' -- then the head phase advances by
+the decayed velocity.  Velocity too small to move the head a visible LED
+in one tick snaps to zero so the wheel parks cleanly instead of creeping;
+the phase is kept as a float in [0, 64) so slow speeds still accumulate."
+  (let* ((halflife (max 0.001 agent-shell-monome-arc-tokens-spinner-halflife))
+         (tick (max 0.001 agent-shell-monome-tick-seconds))
+         (decay (expt 0.5 (/ tick halflife)))
+         (velocity (* decay (or (alist-get :tokens-spinner-velocity
+                                           agent-shell-monome--state)
+                                0.0)))
+         (velocity (if (< (* velocity 64.0 tick) 0.5) 0.0 velocity))
          (phase (mod (+ (or (alist-get :tokens-spinner-phase
                                        agent-shell-monome--state)
                             0.0)
-                        advance)
+                        (* velocity 64.0 tick))
                      64.0)))
+    (setf (alist-get :tokens-spinner-velocity agent-shell-monome--state) velocity)
     (setf (alist-get :tokens-spinner-phase agent-shell-monome--state) phase)
-    phase))
+    velocity))
 
 (defun agent-shell-monome--render-tokens ()
-  "Draw ring 4: a token-rate spinner plus effort markers.
-The wedge is a comet -- a bright head trailing a fading tail -- rotating
-at a speed proportional to the rolling token rate (faster = more tokens,
-still when idle).  Higher rates also lengthen and brighten the comet.
+  "Draw ring 4: a token-momentum flywheel plus effort markers.
+The wedge is a comet -- a bright head trailing a fading tail -- driven
+like a flywheel: each burst of tokens spins it faster (see
+`agent-shell-monome--spin-up-flywheel') and friction winds it down once
+the flow stops (`agent-shell-monome--coast-flywheel').  The comet
+brightens and lengthens with speed and goes dark once the wheel parks.
 Effort-level markers are overlaid so the ring still doubles as the
 thought-level control."
   (let* ((n agent-shell-monome-arc-tokens-encoder)
-         (saturation (min 1.0 (/ (agent-shell-monome--tokens-rate)
-                                 (max 1.0 agent-shell-monome-arc-tokens-max-rate))))
-         (phase (agent-shell-monome--advance-spinner-phase saturation))
-         (head (mod (round phase) 64))
-         (head-level (min 15 (round (+ 3 (* 12 saturation)))))
+         (velocity (agent-shell-monome--coast-flywheel))
+         (saturation (min 1.0 (/ velocity
+                                 (max 0.001 agent-shell-monome-arc-tokens-spinner-max-rps))))
+         (head (mod (round (or (alist-get :tokens-spinner-phase
+                                          agent-shell-monome--state)
+                               0.0))
+                    64))
+         (head-level (min 15 (round (* 15 saturation))))
          (tail (max 2 (round (+ 2 (* 6 saturation)))))
          (info (agent-shell-monome--effort-info))
          (leds (make-vector 64 0)))
     ;; Comet: bright head with a tail fading off behind it (lower indices).
-    (dotimes (k tail)
-      (let ((level (round (* head-level (/ (float (- tail k)) tail)))))
-        (when (> level 0)
-          (aset leds (mod (- head k) 64) level))))
+    ;; Only while spinning -- a parked wheel leaves just the effort markers.
+    (when (> saturation 0)
+      (dotimes (k tail)
+        (let ((level (round (* head-level (/ (float (- tail k)) tail)))))
+          (when (> level 0)
+            (aset leds (mod (- head k) 64) level)))))
     ;; Effort-level markers overlaid: one per level, brightest at current.
     (when info
       (let* ((levels (nth 0 info))
@@ -1473,7 +1507,6 @@ live mic is unmistakable; every other key reflects its buffer status."
     (when (zerop (mod (or (alist-get :tick agent-shell-monome--state) 0) 50))
       (setf (alist-get :last-ring-maps agent-shell-monome--state) nil))
     (agent-shell-monome--decay-decision-accumulator)
-    (agent-shell-monome--prune-tokens-history)
     (agent-shell-monome--prune-tokens-subscriptions)
     (dolist (buffer (agent-shell-buffers))
       (agent-shell-monome--ensure-tokens-subscribed buffer))
@@ -1541,9 +1574,9 @@ live mic is unmistakable; every other key reflects its buffer status."
                 (cons :scroll-accumulator 0)
                 (cons :decision-accumulator 0)
                 (cons :effort-accumulator 0)
-                (cons :tokens-history nil)
                 (cons :tokens-last-totals nil)
                 (cons :tokens-subscriptions nil)
+                (cons :tokens-spinner-velocity 0.0)
                 (cons :tokens-spinner-phase 0.0)
                 (cons :last-ring-leds nil)
                 (cons :last-ring-maps nil)

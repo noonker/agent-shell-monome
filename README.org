@@ -82,15 +82,19 @@ While idle the ring shows two small marker LEDs at 12 and 6 o'clock
 when a permission is armed.  As you turn, the half-ring on that side
 fills in proportion to how close you are to threshold.
 
-** Ring 4 - token rate (and effort)
+** Ring 4 - token momentum (and effort)
 
-A wedge "spinner" rotates around the ring at a speed proportional to the
-rolling token rate (tokens/second summed across all known agent-shell
-buffers, averaged over a 60-second window by default): still when idle,
-faster the more tokens are flowing, topping out at
-~agent-shell-monome-arc-tokens-spinner-max-rps~ revolutions per second
-once the rate reaches ~agent-shell-monome-arc-tokens-max-rate~.  Busier
-rates also lengthen and brighten the comet.
+A wedge "spinner" rides around the ring like a flywheel: each turn's
+token usage (summed across all known agent-shell buffers) gives it an
+angular kick, and friction winds it back down when the flow stops.  A
+burst of ~agent-shell-monome-arc-tokens-spinner-spinup-tokens~ takes it
+from a standstill to full speed
+(~agent-shell-monome-arc-tokens-spinner-max-rps~ revolutions per
+second); smaller bursts add proportionally less, so bursty traffic
+accumulates into speed.  Idle, the wheel coasts down, halving its speed
+every ~agent-shell-monome-arc-tokens-spinner-halflife~ seconds until it
+parks.  Faster spin also lengthens and brightens the comet; a parked
+wheel goes dark, leaving only the effort markers.
 
 When the selected buffer's agent advertises a ~thought_level~ config
 option, turning the encoder also steps the level up (clockwise) or
@@ -134,10 +138,10 @@ list.  Highlights:
   (see the Grid section for the full set of options).
 - ~agent-shell-monome-arc-decision-threshold~ - encoder ticks required
   to commit a yes/no decision (larger = harder to trigger accidentally).
-- ~agent-shell-monome-arc-tokens-window-seconds~ - moving-window length
-  used for the token-rate calculation.
-- ~agent-shell-monome-arc-tokens-max-rate~ - token rate (tokens/second)
-  at which ring 4's spinner reaches full speed.
+- ~agent-shell-monome-arc-tokens-spinner-spinup-tokens~ - tokens that
+  spin ring 4's flywheel from rest to full speed (lower = twitchier).
+- ~agent-shell-monome-arc-tokens-spinner-halflife~ - seconds for the idle
+  flywheel to coast to half speed (larger = heavier, spins longer).
 - ~agent-shell-monome-arc-tokens-spinner-max-rps~ - that full speed, in
   revolutions per second.
 - ~agent-shell-monome-arc-selector-encoder~,
