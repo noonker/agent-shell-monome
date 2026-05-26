@@ -17,9 +17,12 @@ Each agent-shell buffer maps to one grid key:
 - Bright LED :: agent is blocked waiting for input (permission prompt).
 
 Tapping a lit key jumps to that buffer.  Pressing an *unlit* key
-spawns a new agent-shell, rooted at the project of whichever buffer
-is currently selected (falling back to its ~default-directory~).
-Disable via ~agent-shell-monome-spawn-on-empty-press~.
+spawns a new agent-shell.  If the pressed column already belongs to a
+project, the new shell is rooted there, so an empty press stacks into
+that column's project; an empty column with no project yet falls back
+to the project of the currently selected buffer (or its
+~default-directory~).  Disable via
+~agent-shell-monome-spawn-on-empty-press~.
 
 ** Hold to talk (voice input)
 
@@ -76,9 +79,13 @@ fills in proportion to how close you are to threshold.
 
 ** Ring 4 - token rate (and effort)
 
-Visual fill proportional to the rolling token rate (tokens/second
-summed across all known agent-shell buffers, averaged over a 60-second
-window by default).
+A wedge "spinner" rotates around the ring at a speed proportional to the
+rolling token rate (tokens/second summed across all known agent-shell
+buffers, averaged over a 60-second window by default): still when idle,
+faster the more tokens are flowing, topping out at
+~agent-shell-monome-arc-tokens-spinner-max-rps~ revolutions per second
+once the rate reaches ~agent-shell-monome-arc-tokens-max-rate~.  Busier
+rates also lengthen and brighten the comet.
 
 When the selected buffer's agent advertises a ~thought_level~ config
 option, turning the encoder also steps the level up (clockwise) or
@@ -124,8 +131,10 @@ list.  Highlights:
   to commit a yes/no decision (larger = harder to trigger accidentally).
 - ~agent-shell-monome-arc-tokens-window-seconds~ - moving-window length
   used for the token-rate calculation.
-- ~agent-shell-monome-arc-tokens-max-rate~ - rate at which ring 4
-  saturates (tokens/second).
+- ~agent-shell-monome-arc-tokens-max-rate~ - token rate (tokens/second)
+  at which ring 4's spinner reaches full speed.
+- ~agent-shell-monome-arc-tokens-spinner-max-rps~ - that full speed, in
+  revolutions per second.
 - ~agent-shell-monome-arc-selector-encoder~,
   ~agent-shell-monome-arc-scroll-encoder~,
   ~agent-shell-monome-arc-decision-encoder~,

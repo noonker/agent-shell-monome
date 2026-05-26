@@ -172,7 +172,16 @@ Gives a freshly started daemon time to bind its discovery port."
   :type 'number)
 
 (defcustom agent-shell-monome-arc-tokens-max-rate 200.0
-  "Token rate (tokens/sec) at which the ring 4 fill saturates."
+  "Token rate (tokens/sec) at which the ring 4 spinner reaches full speed."
+  :type 'number)
+
+(defcustom agent-shell-monome-arc-tokens-spinner-max-rps 1.0
+  "Ring 4 spinner speed, in revolutions per second, at the max token rate.
+Ring 4 shows token throughput as a wedge rotating around the ring: it
+sits still when idle and spins this fast once the rolling token rate
+reaches `agent-shell-monome-arc-tokens-max-rate', scaling linearly in
+between.  Expressed per second, so it is independent of
+`agent-shell-monome-tick-seconds'."
   :type 'number)
 
 (defcustom agent-shell-monome-arc-effort-ticks-per-step 32
@@ -269,6 +278,8 @@ Top-level keys:
   :selected-index       - Index into (agent-shell-buffers) selected by ring 1.
   :scroll-accumulator   - Accumulated delta for ring 2.
   :decision-accumulator - Accumulated delta for ring 3.
+  :tokens-spinner-phase - Ring 4 spinner head position, a float in [0, 64),
+                          advanced each tick at a token-rate-scaled speed.
   :last-ring-leds       - Alist of ((N . X) . LEVEL) of last sent ring LED.
 
   ;; Permissions
@@ -605,14 +616,19 @@ Prefer the project of the selected window's buffer; fall back to its
                (expand-file-name root)))
         (expand-file-name default-directory))))
 
-(defun agent-shell-monome--spawn-shell-here ()
-  "Start a new agent-shell rooted at the current project, if possible."
+(defun agent-shell-monome--spawn-shell-here (&optional col)
+  "Start a new agent-shell, if possible.
+With COL, root it at the project that already owns grid column COL, so an
+empty press in a project's column spawns into that project rather than
+wherever Emacs focus happens to be.  Fall back to the selected window's
+project when COL is nil or owns no project yet."
   (when (fboundp 'agent-shell--new-shell)
-    (condition-case err
-        (agent-shell--new-shell
-         :location (agent-shell-monome--current-project-root))
-      (error
-       (message "agent-shell-monome: spawn failed: %S" err)))))
+    (let ((root (or (and col (agent-shell-monome--project-for-column col))
+                    (agent-shell-monome--current-project-root))))
+      (condition-case err
+          (agent-shell--new-shell :location root)
+        (error
+         (message "agent-shell-monome: spawn failed: %S" err))))))
 
 (defun agent-shell-monome--on-grid-key (x y state)
   "Handle a grid key event at (X, Y) with STATE (1=down, 0=up)."
@@ -635,7 +651,7 @@ hold begins recording."
      (buffer
       (agent-shell-monome--prune-bindings))
      (agent-shell-monome-spawn-on-empty-press
-      (agent-shell-monome--spawn-shell-here)))))
+      (agent-shell-monome--spawn-shell-here x)))))
 
 (defun agent-shell-monome--on-grid-key-up (x y)
   "Handle a grid key release at (X, Y).
@@ -787,6 +803,10 @@ Returns nil when every column is already taken by a different project."
             (setf (alist-get :project-columns agent-shell-monome--state) cols)
             col)))))
 
+(defun agent-shell-monome--project-for-column (col)
+  "Return the project root currently assigned to grid column COL, or nil."
+  (car (rassoc col (alist-get :project-columns agent-shell-monome--state))))
+
 (defun agent-shell-monome--prune-project-columns ()
   "Drop column assignments whose project has no remaining buffers."
   (let* ((bindings (alist-get :bindings agent-shell-monome--state))
@@ -936,23 +956,45 @@ sent for ring N so an unchanged ring stays quiet."
 
 ;;; Arc: ring 1 (buffer selector)
 
-(defun agent-shell-monome--selected-buffer ()
-  "Return the currently selected agent-shell buffer, or nil."
+(defun agent-shell-monome--indexed-buffer ()
+  "Return the agent-shell buffer the ring-1 dial points at, or nil.
+This reflects `:selected-index' only, independent of Emacs focus, so the
+selector can advance the dial without it being snapped back to the
+focused window mid-turn."
   (let* ((buffers (seq-filter #'buffer-live-p (agent-shell-buffers)))
          (n (length buffers)))
     (when (> n 0)
-      (let ((index (mod (or (alist-get :selected-index agent-shell-monome--state)
-                            0)
-                        n)))
-        (nth index buffers)))))
+      (nth (mod (or (alist-get :selected-index agent-shell-monome--state) 0) n)
+           buffers))))
+
+(defun agent-shell-monome--selected-buffer ()
+  "Return the currently selected agent-shell buffer, or nil.
+When the selected Emacs window is showing an agent-shell buffer, treat
+that as the selection and sync `:selected-index' to it -- so the arc's
+scroll/effort rings and ring 1's wedge act on whatever shell you are
+actually looking at, even after a grid tap or an ordinary buffer switch
+\(neither of which moves the ring-1 dial).  Otherwise fall back to the
+buffer the dial points at."
+  (let* ((buffers (seq-filter #'buffer-live-p (agent-shell-buffers)))
+         (focused-pos (and buffers
+                           (seq-position buffers
+                                         (window-buffer (selected-window))
+                                         #'eq))))
+    (if focused-pos
+        (progn
+          (setf (alist-get :selected-index agent-shell-monome--state)
+                focused-pos)
+          (nth focused-pos buffers))
+      (agent-shell-monome--indexed-buffer))))
 
 (defun agent-shell-monome--show-selected-buffer ()
-  "Display the currently selected buffer in Emacs.
+  "Display the dial's selected buffer in Emacs.
 Mirrors the grid key gesture (`pop-to-buffer') so turning the selector
 dial switches the visible/active agent-shell, not just the arc ring's
-pointer wedge.  Errors are swallowed since this runs from the OSC
-process filter."
-  (when-let ((buffer (agent-shell-monome--selected-buffer)))
+pointer wedge.  Uses the dial position (not the focus-following
+selection) so advancing the dial actually moves off the focused buffer.
+Errors are swallowed since this runs from the OSC process filter."
+  (when-let ((buffer (agent-shell-monome--indexed-buffer)))
     (when (buffer-live-p buffer)
       (condition-case err
           (pop-to-buffer buffer)
@@ -1020,9 +1062,14 @@ changes which agent-shell is shown in Emacs."
 ;;; Arc: ring 2 (scroll)
 
 (defun agent-shell-monome--scroll-target-window (buffer)
-  "Return a window displaying BUFFER, or nil."
+  "Return a window displaying BUFFER, or nil.
+Prefer the selected window when it is the one showing BUFFER, so scrolling
+never lands on a stray background copy of the same buffer on another
+window or frame."
   (when (buffer-live-p buffer)
-    (get-buffer-window buffer t)))
+    (if (eq (window-buffer (selected-window)) buffer)
+        (selected-window)
+      (get-buffer-window buffer t))))
 
 (defun agent-shell-monome--scroll-on-delta (delta)
   "Scroll the selected buffer by DELTA encoder ticks."
@@ -1285,18 +1332,45 @@ level in LEVELS."
                                 err))))))))
     (setf (alist-get :effort-accumulator agent-shell-monome--state) acc)))
 
+(defun agent-shell-monome--advance-spinner-phase (saturation)
+  "Advance and return the ring 4 spinner head position for this tick.
+Speed scales with SATURATION (the token rate as a fraction in [0, 1] of
+`agent-shell-monome-arc-tokens-max-rate'): a saturation of 0 parks the
+wedge, 1 spins it at `agent-shell-monome-arc-tokens-spinner-max-rps'
+revolutions per second.  The phase is kept as a float in [0, 64) so slow
+speeds accumulate instead of rounding away to a standstill."
+  (let* ((rps (* agent-shell-monome-arc-tokens-spinner-max-rps saturation))
+         (advance (* rps 64.0 agent-shell-monome-tick-seconds))
+         (phase (mod (+ (or (alist-get :tokens-spinner-phase
+                                       agent-shell-monome--state)
+                            0.0)
+                        advance)
+                     64.0)))
+    (setf (alist-get :tokens-spinner-phase agent-shell-monome--state) phase)
+    phase))
+
 (defun agent-shell-monome--render-tokens ()
-  "Draw ring 4: token rate as a proportional fill plus effort markers."
+  "Draw ring 4: a token-rate spinner plus effort markers.
+The wedge is a comet -- a bright head trailing a fading tail -- rotating
+at a speed proportional to the rolling token rate (faster = more tokens,
+still when idle).  Higher rates also lengthen and brighten the comet.
+Effort-level markers are overlaid so the ring still doubles as the
+thought-level control."
   (let* ((n agent-shell-monome-arc-tokens-encoder)
-         (rate (agent-shell-monome--tokens-rate))
-         (saturation (min 1.0 (/ rate
+         (saturation (min 1.0 (/ (agent-shell-monome--tokens-rate)
                                  (max 1.0 agent-shell-monome-arc-tokens-max-rate))))
-         (lit (round (* 64 saturation)))
-         (level (round (+ 2 (* 10 saturation))))
+         (phase (agent-shell-monome--advance-spinner-phase saturation))
+         (head (mod (round phase) 64))
+         (head-level (min 15 (round (+ 3 (* 12 saturation)))))
+         (tail (max 2 (round (+ 2 (* 6 saturation)))))
          (info (agent-shell-monome--effort-info))
          (leds (make-vector 64 0)))
-    (dotimes (x 64)
-      (when (< x lit) (aset leds x level)))
+    ;; Comet: bright head with a tail fading off behind it (lower indices).
+    (dotimes (k tail)
+      (let ((level (round (* head-level (/ (float (- tail k)) tail)))))
+        (when (> level 0)
+          (aset leds (mod (- head k) 64) level))))
+    ;; Effort-level markers overlaid: one per level, brightest at current.
     (when info
       (let* ((levels (nth 0 info))
              (current (nth 1 info))
@@ -1424,6 +1498,7 @@ live mic is unmistakable; every other key reflects its buffer status."
                 (cons :tokens-history nil)
                 (cons :tokens-last-totals nil)
                 (cons :tokens-subscriptions nil)
+                (cons :tokens-spinner-phase 0.0)
                 (cons :last-ring-leds nil)
                 (cons :last-ring-maps nil)
                 ;; Permissions

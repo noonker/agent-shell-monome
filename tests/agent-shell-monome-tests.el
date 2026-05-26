@@ -461,5 +461,152 @@
             (should (equal "some transcription" (buffer-string)))))
       (kill-buffer stdout))))
 
+;;;; Empty-press spawn roots at the pressed column's project
+
+(ert-deftest agent-shell-monome--project-for-column-reverse-lookup ()
+  ;; :project-columns maps project -> column; the reverse lookup recovers
+  ;; the project that owns a given column, or nil for an unclaimed one.
+  (let ((agent-shell-monome--state
+         (list (cons :project-columns '(("/proj/a" . 0) ("/proj/b" . 1))))))
+    (should (equal "/proj/a" (agent-shell-monome--project-for-column 0)))
+    (should (equal "/proj/b" (agent-shell-monome--project-for-column 1)))
+    (should-not (agent-shell-monome--project-for-column 2))))
+
+(ert-deftest agent-shell-monome--empty-press-spawns-into-pressed-column ()
+  ;; Pressing an unlit key in a column owned by project B spawns a shell
+  ;; rooted at B -- not at whatever buffer Emacs happens to have focused.
+  (let ((agent-shell-monome--state
+         (list (cons :bindings nil)
+               (cons :project-columns '(("/proj/a" . 0) ("/proj/b" . 1)))))
+        (agent-shell-monome-spawn-on-empty-press t)
+        (spawned-at 'unset))
+    (cl-letf (((symbol-function 'agent-shell--new-shell)
+               (lambda (&rest args) (setq spawned-at (plist-get args :location))))
+              ;; Focus resolves to project A; the press must ignore it.
+              ((symbol-function 'agent-shell-monome--current-project-root)
+               (lambda () "/proj/a")))
+      ;; Empty key at column 1 (project B's column), any row.
+      (agent-shell-monome--on-grid-key-down 1 4)
+      (should (equal "/proj/b" spawned-at)))))
+
+(ert-deftest agent-shell-monome--empty-press-unclaimed-column-falls-back ()
+  ;; An empty press in a column no project owns yet falls back to the
+  ;; selected buffer's project.
+  (let ((agent-shell-monome--state
+         (list (cons :bindings nil)
+               (cons :project-columns '(("/proj/a" . 0)))))
+        (agent-shell-monome-spawn-on-empty-press t)
+        (spawned-at 'unset))
+    (cl-letf (((symbol-function 'agent-shell--new-shell)
+               (lambda (&rest args) (setq spawned-at (plist-get args :location))))
+              ((symbol-function 'agent-shell-monome--current-project-root)
+               (lambda () "/fallback")))
+      (agent-shell-monome--on-grid-key-down 5 0)
+      (should (equal "/fallback" spawned-at)))))
+
+;;;; Selected buffer follows the focused agent-shell window
+
+(ert-deftest agent-shell-monome--selected-buffer-follows-focus ()
+  ;; When the selected window shows an agent-shell buffer, that is the
+  ;; selection and :selected-index is synced to it -- so a grid tap (which
+  ;; never moves the ring-1 dial) still steers the arc's scroll/effort.
+  (cl-letf* ((buffers '(a b c))
+             ((symbol-function 'agent-shell-buffers) (lambda () buffers))
+             ((symbol-function 'buffer-live-p) (lambda (_) t))
+             ((symbol-function 'selected-window) (lambda () 'win))
+             ((symbol-function 'window-buffer) (lambda (_) 'b)))
+    (let ((agent-shell-monome--state (list (cons :selected-index 0))))
+      (should (eq 'b (agent-shell-monome--selected-buffer)))
+      (should (= 1 (alist-get :selected-index agent-shell-monome--state))))))
+
+(ert-deftest agent-shell-monome--selected-buffer-falls-back-off-shell ()
+  ;; When focus is not on an agent-shell buffer, fall back to the dial
+  ;; position and leave :selected-index untouched.
+  (cl-letf* ((buffers '(a b c))
+             ((symbol-function 'agent-shell-buffers) (lambda () buffers))
+             ((symbol-function 'buffer-live-p) (lambda (_) t))
+             ((symbol-function 'selected-window) (lambda () 'win))
+             ((symbol-function 'window-buffer) (lambda (_) 'not-a-shell)))
+    (let ((agent-shell-monome--state (list (cons :selected-index 2))))
+      (should (eq 'c (agent-shell-monome--selected-buffer)))
+      (should (= 2 (alist-get :selected-index agent-shell-monome--state))))))
+
+(ert-deftest agent-shell-monome--indexed-buffer-ignores-focus ()
+  ;; The dial accessor reflects :selected-index regardless of focus, so the
+  ;; selector can advance without snapping back to the focused window.
+  (cl-letf* ((buffers '(a b c))
+             ((symbol-function 'agent-shell-buffers) (lambda () buffers))
+             ((symbol-function 'buffer-live-p) (lambda (_) t))
+             ((symbol-function 'selected-window) (lambda () 'win))
+             ((symbol-function 'window-buffer) (lambda (_) 'a)))
+    (let ((agent-shell-monome--state (list (cons :selected-index 2))))
+      (should (eq 'c (agent-shell-monome--indexed-buffer))))))
+
+(ert-deftest agent-shell-monome--selector-advances-despite-focus ()
+  ;; Regression: with the focused window showing buffer a, turning ring 1
+  ;; one step still advances the dial to b and displays b -- the
+  ;; focus-following selection must not drag the dial back to a.
+  (cl-letf* ((buffers '(a b c d))
+             ((symbol-function 'agent-shell-buffers) (lambda () buffers))
+             ((symbol-function 'buffer-live-p) (lambda (_) t))
+             ((symbol-function 'selected-window) (lambda () 'win))
+             ((symbol-function 'window-buffer) (lambda (_) 'a)) ; focus on a
+             (shown 'unset)
+             ((symbol-function 'pop-to-buffer)
+              (lambda (buf &rest _) (setq shown buf))))
+    (let ((agent-shell-monome--state
+           (list (cons :selected-index 0)
+                 (cons :selector-accumulator 0)))
+          (agent-shell-monome-arc-selector-ticks-per-step 4))
+      (agent-shell-monome--selector-on-delta 4)
+      (should (= 1 (alist-get :selected-index agent-shell-monome--state)))
+      (should (eq 'b shown)))))
+
+;;;; Scroll targets the focused window, not a background copy
+
+(ert-deftest agent-shell-monome--scroll-target-prefers-selected-window ()
+  ;; When the selected window is the one showing the buffer, scroll there
+  ;; rather than letting get-buffer-window pick a stray background copy.
+  (cl-letf (((symbol-function 'buffer-live-p) (lambda (_) t))
+            ((symbol-function 'selected-window) (lambda () 'sel-win))
+            ((symbol-function 'window-buffer) (lambda (_) 'buf))
+            ((symbol-function 'get-buffer-window)
+             (lambda (&rest _) (error "must not reach for a background window"))))
+    (should (eq 'sel-win (agent-shell-monome--scroll-target-window 'buf)))))
+
+(ert-deftest agent-shell-monome--scroll-target-other-window-when-unfocused ()
+  ;; If the buffer is not in the selected window, fall back to any window
+  ;; showing it.
+  (cl-letf (((symbol-function 'buffer-live-p) (lambda (_) t))
+            ((symbol-function 'selected-window) (lambda () 'sel-win))
+            ((symbol-function 'window-buffer) (lambda (_) 'other-buf))
+            ((symbol-function 'get-buffer-window) (lambda (&rest _) 'bg-win)))
+    (should (eq 'bg-win (agent-shell-monome--scroll-target-window 'buf)))))
+
+;;;; Ring 4 token-rate spinner
+
+(ert-deftest agent-shell-monome--spinner-parked-when-idle ()
+  ;; Zero saturation (no tokens) leaves the spinner head where it is.
+  (let ((agent-shell-monome--state (list (cons :tokens-spinner-phase 12.0)))
+        (agent-shell-monome-arc-tokens-spinner-max-rps 1.0)
+        (agent-shell-monome-tick-seconds 0.1))
+    (should (= 12.0 (agent-shell-monome--advance-spinner-phase 0.0)))
+    (should (= 12.0 (agent-shell-monome--advance-spinner-phase 0.0)))))
+
+(ert-deftest agent-shell-monome--spinner-speed-scales-and-wraps ()
+  ;; Advance per tick is max-rps * 64 * tick-seconds * saturation, kept as a
+  ;; float phase in [0, 64).  Here: 1 rev/s * 64 * 0.25s = 16 LEDs/tick at
+  ;; full saturation.
+  (let ((agent-shell-monome--state (list (cons :tokens-spinner-phase 0.0)))
+        (agent-shell-monome-arc-tokens-spinner-max-rps 1.0)
+        (agent-shell-monome-tick-seconds 0.25))
+    (should (= 16.0 (agent-shell-monome--advance-spinner-phase 1.0)))
+    (should (= 32.0 (agent-shell-monome--advance-spinner-phase 1.0)))
+    (should (= 48.0 (agent-shell-monome--advance-spinner-phase 1.0)))
+    ;; 48 + 16 = 64 wraps back to 0.
+    (should (= 0.0 (agent-shell-monome--advance-spinner-phase 1.0)))
+    ;; Half the rate advances half as fast.
+    (should (= 8.0 (agent-shell-monome--advance-spinner-phase 0.5)))))
+
 (provide 'agent-shell-monome-tests)
 ;;; agent-shell-monome-tests.el ends here
