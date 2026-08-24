@@ -1118,29 +1118,35 @@ by the send-grid stub in these tests, most recent first."
     (should-not (agent-shell-monome--show-all-key-p 15 7))))
 
 (ert-deftest agent-shell-monome--show-all-toggles-on-then-off ()
-  ;; First tap tiles every live shell into its own window (snapshotting
-  ;; the pre-show config first); second tap restores the snapshotted
-  ;; config verbatim.  The bright/dim LED state follows the flag.
+  ;; First tap tiles every live shell (snapshotting the pre-show config
+  ;; first); second tap restores the snapshotted config verbatim.  The
+  ;; bright/dim LED state follows the flag.  We stub the tile-dimensions
+  ;; picker to a fixed 2x2 so this test does not depend on the batch
+  ;; frame's actual size.
   (let ((agent-shell-monome--state
          (list (cons :grid-width 4)
                (cons :grid-height 4)
                (cons :show-all-window-config nil)))
-        (tiled nil)
-        (restored nil))
+        (placed nil)
+        (restored nil)
+        (window-counter 0))
     (cl-letf (((symbol-function 'agent-shell-buffers)
-               (lambda () '(a b c)))
+               (lambda () '(a b c d)))
               ((symbol-function 'buffer-live-p) (lambda (_) t))
               ((symbol-function 'current-window-configuration)
                (lambda () 'saved-config))
               ((symbol-function 'delete-other-windows) (lambda () nil))
-              ((symbol-function 'switch-to-buffer)
-               (lambda (b) (push (list 'switch b) tiled)))
+              ((symbol-function 'selected-window) (lambda () 'W0))
               ((symbol-function 'split-window)
-               (lambda (&rest _) 'new-window))
+               (lambda (&rest _)
+                 (setq window-counter (1+ window-counter))
+                 (intern (format "W%d" window-counter))))
               ((symbol-function 'set-window-buffer)
-               (lambda (_w b) (push (list 'set b) tiled)))
+               (lambda (window buf) (push (cons window buf) placed)))
               ((symbol-function 'select-window) (lambda (_w) nil))
               ((symbol-function 'balance-windows) (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell-monome--tile-dimensions)
+               (lambda (&rest _) (cons 2 2)))
               ((symbol-function 'set-window-configuration)
                (lambda (c) (setq restored c))))
       ;; First press: tile.
@@ -1148,16 +1154,38 @@ by the send-grid stub in these tests, most recent first."
       (should (eq 'saved-config
                   (alist-get :show-all-window-config
                              agent-shell-monome--state)))
-      ;; Each shell should have been shown once: first as switch-to-buffer,
-      ;; the rest as split + set-window-buffer.
-      (should (equal '(switch a) (car (last tiled))))
-      (should (memq 'b (mapcar #'cadr tiled)))
-      (should (memq 'c (mapcar #'cadr tiled)))
+      ;; Every one of the four buffers landed in some window.
+      (should (equal '(a b c d)
+                     (sort (mapcar #'cdr placed) #'string<)))
       ;; Second press: restore the saved config exactly.
       (agent-shell-monome--on-grid-key-down 1 3)
       (should (eq 'saved-config restored))
       (should-not (alist-get :show-all-window-config
                              agent-shell-monome--state)))))
+
+(ert-deftest agent-shell-monome--tile-dimensions-picks-square-when-even ()
+  ;; 4 shells in a landscape frame tile as 2x2 (waste=0, aspect fine),
+  ;; not 3x2 with a stray blank cell nor 4x1 slivers.
+  (should (equal (cons 2 2)
+                 (agent-shell-monome--tile-dimensions 4 200 50))))
+
+(ert-deftest agent-shell-monome--tile-dimensions-prefers-wider-than-tall ()
+  ;; A single row of narrow slivers for many agents is exactly what the
+  ;; old \"one column per agent\" layout gave; the new picker must NOT
+  ;; land on cols=n even for landscape frames.
+  (let* ((dims (agent-shell-monome--tile-dimensions 6 200 50))
+         (cols (car dims))
+         (rows (cdr dims)))
+    (should (> rows 1))
+    (should (< cols 6))
+    (should (>= (* cols rows) 6))))
+
+(ert-deftest agent-shell-monome--tile-dimensions-trivial-cases ()
+  ;; N of 0 or 1 collapses to a single pane; N == 2 in a landscape
+  ;; frame is a single row of two.
+  (should (equal (cons 1 1) (agent-shell-monome--tile-dimensions 0 200 50)))
+  (should (equal (cons 1 1) (agent-shell-monome--tile-dimensions 1 200 50)))
+  (should (equal (cons 2 1) (agent-shell-monome--tile-dimensions 2 200 50))))
 
 (ert-deftest agent-shell-monome--show-all-noop-with-no-shells ()
   ;; Tapping with no live agent-shell buffers must not touch the window

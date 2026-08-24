@@ -854,31 +854,94 @@ exactly.  Turning it on with no live shells is a no-op."
       (agent-shell-monome--restore-window-config)
     (agent-shell-monome--show-all-agents)))
 
+(defun agent-shell-monome--tile-dimensions (n frame-width frame-height)
+  "Return (COLS . ROWS) for tiling N panes into FRAME-WIDTH x FRAME-HEIGHT.
+Picks the (cols, rows) that minimizes a score of two competing costs:
+- deviation from a comfortable per-pane text aspect (~2.5:1 chars w:h,
+  which reads well for shell content), so panes never end up as
+  slivers regardless of frame shape; and
+- wasted cells (cols*rows - n), so 4 buffers tile as 2x2 not 3x2 with
+  a stray blank cell.
+
+Returns (1 . 1) for N <= 1.  Both FRAME-WIDTH and FRAME-HEIGHT are in
+character cells (`frame-width' / `frame-height')."
+  (if (<= n 1)
+      (cons 1 1)
+    (let ((best-cols 1)
+          (best-score 1.0e+INF)
+          (target-aspect 2.5)
+          (waste-weight 0.5))
+      (dotimes (i n)
+        (let* ((cols (1+ i))
+               (rows (ceiling (/ (float n) cols)))
+               (pane-w (/ (float frame-width) cols))
+               (pane-h (/ (float frame-height) rows))
+               (aspect (/ pane-w (max 1.0 pane-h)))
+               (aspect-dev (abs (log (/ aspect target-aspect))))
+               (waste (- (* cols rows) n))
+               (score (+ aspect-dev (* waste-weight waste))))
+          (when (< score best-score)
+            (setq best-score score)
+            (setq best-cols cols))))
+      (cons best-cols (ceiling (/ (float n) best-cols))))))
+
 (defun agent-shell-monome--show-all-agents ()
-  "Tile every live agent-shell buffer, one pane per agent.
+  "Tile every live agent-shell buffer into a balanced grid.
 Saves the current window configuration into `:show-all-window-config'
 so `--restore-window-config' can undo the layout on the second tap.
-Uses horizontal (side-by-side) splits since agent-shell content tends
-to be tall and narrow, then `balance-windows' evens the widths."
+The grid shape is chosen by `--tile-dimensions' to keep per-pane aspect
+readable regardless of frame shape or agent count -- a lone horizontal
+row of narrow slivers is what the naive one-pane-per-agent approach
+gave and this replaces."
   (let* ((buffers (seq-filter #'buffer-live-p (agent-shell-buffers))))
     (when buffers
       (setf (alist-get :show-all-window-config agent-shell-monome--state)
             (current-window-configuration))
       (condition-case err
-          (progn
-            (delete-other-windows)
-            (switch-to-buffer (car buffers))
-            (dolist (buf (cdr buffers))
-              (when-let* ((window (split-window (selected-window) nil 'right)))
-                (set-window-buffer window buf)
-                (select-window window)))
-            (balance-windows))
+          (agent-shell-monome--tile-buffers buffers)
         (error
          ;; If tiling blew up part-way through, drop the saved config so
          ;; the next tap re-tries rather than restoring a half-built layout.
          (setf (alist-get :show-all-window-config
                           agent-shell-monome--state) nil)
          (message "agent-shell-monome: show-all failed: %S" err))))))
+
+(defun agent-shell-monome--tile-buffers (buffers)
+  "Tile BUFFERS into a balanced grid in the current frame.
+Rows are created by successive downward splits off the newest row
+window (so `row-windows' stays in top-to-bottom visual order) and each
+row is then split rightward to hold up to `cols' buffers.  The last
+row may be partial (fewer than `cols' buffers) -- its buffers still
+land left-aligned and `balance-windows' evens the widths at the end.
+Individual splits are wrapped in `ignore-errors' so a too-small pane
+just gets skipped rather than aborting the whole layout."
+  (let* ((n (length buffers))
+         (dims (agent-shell-monome--tile-dimensions
+                n (frame-width) (frame-height)))
+         (cols (car dims))
+         (rows (cdr dims)))
+    (delete-other-windows)
+    (let ((row-windows (list (selected-window))))
+      (dotimes (_ (1- rows))
+        (when-let* ((last-row (car (last row-windows)))
+                    (new (ignore-errors
+                           (split-window last-row nil 'below))))
+          (setq row-windows (append row-windows (list new)))))
+      (let ((idx 0))
+        (dolist (row-window row-windows)
+          (when (< idx n)
+            (select-window row-window)
+            (set-window-buffer row-window (nth idx buffers))
+            (setq idx (1+ idx))
+            (let ((remaining (min (1- cols) (- n idx))))
+              (dotimes (_ remaining)
+                (when-let* ((new (ignore-errors
+                                   (split-window (selected-window)
+                                                 nil 'right))))
+                  (set-window-buffer new (nth idx buffers))
+                  (select-window new)
+                  (setq idx (1+ idx)))))))))
+    (balance-windows)))
 
 (defun agent-shell-monome--restore-window-config ()
   "Restore the window configuration saved by `--show-all-agents'.
