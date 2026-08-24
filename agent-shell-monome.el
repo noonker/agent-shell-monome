@@ -107,6 +107,8 @@
 (declare-function whisper-recording-p "whisper")
 (declare-function whisper-transcribing-p "whisper")
 (declare-function shell-maker-submit "shell-maker")
+(declare-function somafm-player-volume-down "somafm" (arg))
+(declare-function somafm-player-volume-up "somafm" (arg))
 (defvar agent-shell-permission-responder-function)
 (defvar whisper-insert-text-at-point)
 (defvar whisper-after-transcription-hook)
@@ -283,6 +285,21 @@ and left for you to review and send by hand (or via the arc decision
 ring).  With non-nil it is sent immediately through `shell-maker-submit'."
   :type 'boolean)
 
+(defcustom agent-shell-monome-hold-to-talk-duck-somafm t
+  "When non-nil, duck SomaFM playback while hold-to-talk is recording.
+No-op when the `somafm' package is not loaded or its mpv player process
+is not running, so this is safe to leave on even without SomaFM."
+  :type 'boolean)
+
+(defcustom agent-shell-monome-hold-to-talk-somafm-duck-steps 60
+  "SomaFM volume-down key steps applied while hold-to-talk records.
+Each step is one press of `somafm-mpv-volume-down-key' (mpv's `9' by
+default), and mpv moves the volume by 2 units per press.  On unduck the
+same number of up-steps is applied, so playback returns to its prior
+level rather than an absolute value -- if you nudged the volume during
+the recording, the unduck honors that nudge."
+  :type 'integer)
+
 (defcustom agent-shell-monome-grid-prefix "/monome-grid"
   "OSC address prefix configured on the grid at start.
 Set per-device so messages can be disambiguated when grid and arc are
@@ -395,7 +412,13 @@ Top-level keys:
   :htt-recording        - Buffer currently being recorded into, or nil.
                           Its grid key blinks while set.
   :htt-target           - Buffer to insert the transcription into, read by
-                          the `whisper-after-transcription-hook' handler.")
+                          the `whisper-after-transcription-hook' handler.
+  :htt-somafm-ducked    - Steps applied to `somafm-player-volume-down'
+                          when the recording started, or nil when the
+                          volume is at rest.  Unduck feeds this same
+                          count to `somafm-player-volume-up' so the
+                          restore matches whatever step size was set at
+                          duck time.")
 
 ;;; OSC codec
 ;;
@@ -1190,14 +1213,18 @@ Records via `whisper-run'; the transcription is routed back to BUFFER by
       (setf (alist-get :htt-target agent-shell-monome--state) buffer)
       (setf (alist-get :htt-recording agent-shell-monome--state) buffer)
       (condition-case err
-          ;; Bind `whisper-insert-text-at-point' off for the duration of
-          ;; the start call: it skips whisper's read-only buffer guard
-          ;; (which would otherwise error if the timer fires while a
-          ;; read-only buffer is current) and avoids stashing a point
-          ;; marker we never use -- our hook inserts into the target
-          ;; buffer's prompt itself.
-          (let ((whisper-insert-text-at-point nil))
-            (whisper-run))
+          (progn
+            ;; Bind `whisper-insert-text-at-point' off for the duration
+            ;; of the start call: it skips whisper's read-only buffer
+            ;; guard (which would otherwise error if the timer fires
+            ;; while a read-only buffer is current) and avoids stashing
+            ;; a point marker we never use -- our hook inserts into the
+            ;; target buffer's prompt itself.
+            (let ((whisper-insert-text-at-point nil))
+              (whisper-run))
+            ;; Duck only after whisper-run started cleanly, so a failed
+            ;; start does not silently leave SomaFM at half volume.
+            (agent-shell-monome--htt-duck-somafm))
         (error
          (message "agent-shell-monome: failed to start recording: %S" err)
          (setf (alist-get :htt-target agent-shell-monome--state) nil)
@@ -1208,13 +1235,48 @@ Records via `whisper-run'; the transcription is routed back to BUFFER by
   "Stop the in-progress hold-to-talk recording.
 A second `whisper-run' toggles recording off, which kicks off
 transcription; the resulting text is inserted by
-`agent-shell-monome--whisper-transcription-handler'."
+`agent-shell-monome--whisper-transcription-handler'.  Also restores any
+SomaFM volume ducked at recording start."
   (setf (alist-get :htt-recording agent-shell-monome--state) nil)
   (setf (alist-get :htt-down-coord agent-shell-monome--state) nil)
   (when (and (fboundp 'whisper-recording-p) (whisper-recording-p))
     (condition-case err
         (whisper-run)
-      (error (message "agent-shell-monome: failed to stop recording: %S" err)))))
+      (error (message "agent-shell-monome: failed to stop recording: %S" err))))
+  (agent-shell-monome--htt-unduck-somafm))
+
+(defun agent-shell-monome--htt-duck-somafm ()
+  "Drop SomaFM playback volume for a hold-to-talk recording.
+No-op unless `agent-shell-monome-hold-to-talk-duck-somafm' is on, the
+`somafm' package is loaded, and its mpv player process is live -- so
+this is safe to call whether or not the user has SomaFM running.  The
+step count is recorded in `:htt-somafm-ducked' so `--htt-unduck-somafm'
+can restore the exact same amount."
+  (when (and agent-shell-monome-hold-to-talk-duck-somafm
+             (fboundp 'somafm-player-volume-down)
+             (get-process "somafm player"))
+    (let ((steps agent-shell-monome-hold-to-talk-somafm-duck-steps))
+      (condition-case err
+          (progn
+            (somafm-player-volume-down steps)
+            (setf (alist-get :htt-somafm-ducked
+                             agent-shell-monome--state) steps))
+        (error (message "agent-shell-monome: somafm duck failed: %S" err))))))
+
+(defun agent-shell-monome--htt-unduck-somafm ()
+  "Restore SomaFM volume dropped by `--htt-duck-somafm', if any.
+Reads the stored step count and applies the same many up-steps, so
+relative moves cancel out.  Idempotent: a no-op when no duck is in
+flight, so it is safe to call from any hold-to-talk cleanup path."
+  (when-let ((steps (alist-get :htt-somafm-ducked
+                               agent-shell-monome--state)))
+    (setf (alist-get :htt-somafm-ducked agent-shell-monome--state) nil)
+    (when (and (fboundp 'somafm-player-volume-up)
+               (get-process "somafm player"))
+      (condition-case err
+          (somafm-player-volume-up steps)
+        (error (message "agent-shell-monome: somafm unduck failed: %S"
+                        err))))))
 
 (defun agent-shell-monome--insert-transcription (buffer text)
   "Insert TEXT at BUFFER's shell prompt, submitting when configured.
@@ -2123,7 +2185,8 @@ its tiled view is active -- no pulse."
                 (cons :htt-down-coord nil)
                 (cons :htt-timer nil)
                 (cons :htt-recording nil)
-                (cons :htt-target nil)))
+                (cons :htt-target nil)
+                (cons :htt-somafm-ducked nil)))
     (setq agent-shell-permission-responder-function
           #'agent-shell-monome--responder)
     (setf (alist-get :timer agent-shell-monome--state)

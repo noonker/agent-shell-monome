@@ -1248,5 +1248,83 @@ by the send-grid stub in these tests, most recent first."
       (should (= 15 (agent-shell-monome-tests--last-level-for-coord
                      sent (cons 1 3)))))))
 
+;;;; Hold-to-talk SomaFM ducking
+
+(ert-deftest agent-shell-monome--somafm-duck-drops-and-restores ()
+  ;; Duck records the applied step count in :htt-somafm-ducked; unduck
+  ;; feeds that exact count back to volume-up so relative moves cancel,
+  ;; and clears the field so a second unduck is a no-op.
+  (let ((agent-shell-monome--state (list (cons :htt-somafm-ducked nil)))
+        (agent-shell-monome-hold-to-talk-duck-somafm t)
+        (agent-shell-monome-hold-to-talk-somafm-duck-steps 60)
+        (down nil)
+        (up nil))
+    (cl-letf (((symbol-function 'somafm-player-volume-down)
+               (lambda (n) (setq down n)))
+              ((symbol-function 'somafm-player-volume-up)
+               (lambda (n) (setq up n)))
+              ((symbol-function 'get-process)
+               (lambda (name) (and (equal name "somafm player") 'fake-proc))))
+      (agent-shell-monome--htt-duck-somafm)
+      (should (= 60 down))
+      (should (= 60 (alist-get :htt-somafm-ducked
+                               agent-shell-monome--state)))
+      (agent-shell-monome--htt-unduck-somafm)
+      (should (= 60 up))
+      (should-not (alist-get :htt-somafm-ducked
+                             agent-shell-monome--state))
+      ;; Idempotent: unduck with nothing armed does not touch the volume.
+      (setq up nil)
+      (agent-shell-monome--htt-unduck-somafm)
+      (should-not up))))
+
+(ert-deftest agent-shell-monome--somafm-duck-noop-when-disabled ()
+  ;; With the duck disabled, neither volume-down is called nor the state
+  ;; field set.
+  (let ((agent-shell-monome--state (list (cons :htt-somafm-ducked nil)))
+        (agent-shell-monome-hold-to-talk-duck-somafm nil)
+        (called nil))
+    (cl-letf (((symbol-function 'somafm-player-volume-down)
+               (lambda (&rest _) (setq called t)))
+              ((symbol-function 'get-process)
+               (lambda (_) 'fake-proc)))
+      (agent-shell-monome--htt-duck-somafm)
+      (should-not called)
+      (should-not (alist-get :htt-somafm-ducked
+                             agent-shell-monome--state)))))
+
+(ert-deftest agent-shell-monome--somafm-duck-noop-when-player-absent ()
+  ;; No SomaFM player process running means no duck (safe to leave the
+  ;; feature on even for users who don't run SomaFM most of the time).
+  (let ((agent-shell-monome--state (list (cons :htt-somafm-ducked nil)))
+        (agent-shell-monome-hold-to-talk-duck-somafm t)
+        (called nil))
+    (cl-letf (((symbol-function 'somafm-player-volume-down)
+               (lambda (&rest _) (setq called t)))
+              ((symbol-function 'get-process) (lambda (_) nil)))
+      (agent-shell-monome--htt-duck-somafm)
+      (should-not called)
+      (should-not (alist-get :htt-somafm-ducked
+                             agent-shell-monome--state)))))
+
+(ert-deftest agent-shell-monome--htt-end-unducks-on-release ()
+  ;; The release path (--htt-end) always unducks, even when whisper is
+  ;; no longer recording (e.g. it stopped itself).  Otherwise a duck
+  ;; that succeeded but whose recording ended asynchronously would leave
+  ;; the volume permanently low.
+  (let ((agent-shell-monome--state
+         (list (cons :htt-recording 'buf)
+               (cons :htt-down-coord (cons 0 0))
+               (cons :htt-somafm-ducked 42)))
+        (up nil))
+    (cl-letf (((symbol-function 'whisper-recording-p) (lambda () nil))
+              ((symbol-function 'somafm-player-volume-up)
+               (lambda (n) (setq up n)))
+              ((symbol-function 'get-process) (lambda (_) 'fake-proc)))
+      (agent-shell-monome--htt-end)
+      (should (= 42 up))
+      (should-not (alist-get :htt-somafm-ducked
+                             agent-shell-monome--state)))))
+
 (provide 'agent-shell-monome-tests)
 ;;; agent-shell-monome-tests.el ends here
