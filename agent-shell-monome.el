@@ -67,6 +67,12 @@
 ;;   `M-x agent-shell-monome-set-favorite-projects', which reads from
 ;;   projectile or built-in project.el's known-projects list.
 ;;
+;;   The key immediately left of favorites is the "show-all" toggle.
+;;   Tap once to tile every live agent-shell buffer into its own window
+;;   (one pane per agent, split horizontally and balanced); tap again
+;;   to restore the exact window layout that was on screen before.  The
+;;   key is dim when inactive and steadily bright while show-all is up.
+;;
 ;; Arc (uses the first 3 encoders):
 ;;   Ring 1 (selector) - one indicator LED per buffer at even spacing,
 ;;                       brightness reflects status, a brighter "pointer"
@@ -375,6 +381,11 @@ Top-level keys:
   :favorites-scroll-accumulator - Encoder delta accumulator for the picker.
   :favorites-window            - Window showing the picker buffer while
                                  held; deleted on release.
+
+  ;; Bottom-row show-all toggle
+  :show-all-window-config      - Window configuration to restore when the
+                                 show-all toggle is turned off, or nil
+                                 when show-all is currently inactive.
 
   ;; Hold-to-talk (voice input via whisper)
   :htt-down-coord       - (X . Y) of the key whose hold gesture is active,
@@ -744,6 +755,15 @@ project when COL is nil or owns no project yet."
   "Return non-nil when (X, Y) is the favorites hotkey coordinate."
   (equal (cons x y) (agent-shell-monome--favorites-key-coord)))
 
+(defun agent-shell-monome--show-all-key-coord ()
+  "Return the (X . Y) of the show-all toggle (third from bottom-right)."
+  (cons (- (or (alist-get :grid-width agent-shell-monome--state) 8) 3)
+        (agent-shell-monome--hotkey-row)))
+
+(defun agent-shell-monome--show-all-key-p (x y)
+  "Return non-nil when (X, Y) is the show-all toggle coordinate."
+  (equal (cons x y) (agent-shell-monome--show-all-key-coord)))
+
 (defun agent-shell-monome--on-grid-key (x y state)
   "Handle a grid key event at (X, Y) with STATE (1=down, 0=up)."
   (if (= state 1)
@@ -760,8 +780,9 @@ to it.
 
 The bottom row is reserved for hotkeys: the delete key (bottom-right)
 arms a kill gesture on press, the favorites key (immediately left of
-delete) pops up the favorite-projects picker while held, and any other
-bottom-row key is a no-op for now."
+delete) pops up the favorite-projects picker while held, the show-all
+key (third from the right) toggles a tiled view of every live
+agent-shell buffer, and any other bottom-row key is a no-op for now."
   (cond
    ;; Delete key pressed: enter kill-arm mode.  Do not switch, spawn, or
    ;; arm hold-to-talk on the delete key itself.
@@ -774,6 +795,9 @@ bottom-row key is a no-op for now."
     (setf (alist-get :favorites-scroll-accumulator
                      agent-shell-monome--state) 0)
     (agent-shell-monome--show-favorites))
+   ;; Show-all key pressed: toggle tiled view of every agent-shell.
+   ((agent-shell-monome--show-all-key-p x y)
+    (agent-shell-monome--toggle-show-all))
    ;; Other hotkey-row keys are reserved; no-op for now.
    ((agent-shell-monome--hotkey-row-p y)
     nil)
@@ -817,6 +841,55 @@ no live binding."
           (kill-buffer buffer))
       (error (message "agent-shell-monome: delete failed: %S" err)))
     (agent-shell-monome--prune-bindings)))
+
+;;; Show-all hotkey (tile every agent-shell buffer)
+
+(defun agent-shell-monome--toggle-show-all ()
+  "Toggle a tiled view of every live agent-shell buffer.
+Off -> on: snapshot the current window configuration, then tile every
+live shell buffer into its own horizontally split window (one pane per
+agent, balanced).  On -> off: restore the snapshotted configuration
+exactly.  Turning it on with no live shells is a no-op."
+  (if (alist-get :show-all-window-config agent-shell-monome--state)
+      (agent-shell-monome--restore-window-config)
+    (agent-shell-monome--show-all-agents)))
+
+(defun agent-shell-monome--show-all-agents ()
+  "Tile every live agent-shell buffer, one pane per agent.
+Saves the current window configuration into `:show-all-window-config'
+so `--restore-window-config' can undo the layout on the second tap.
+Uses horizontal (side-by-side) splits since agent-shell content tends
+to be tall and narrow, then `balance-windows' evens the widths."
+  (let* ((buffers (seq-filter #'buffer-live-p (agent-shell-buffers))))
+    (when buffers
+      (setf (alist-get :show-all-window-config agent-shell-monome--state)
+            (current-window-configuration))
+      (condition-case err
+          (progn
+            (delete-other-windows)
+            (switch-to-buffer (car buffers))
+            (dolist (buf (cdr buffers))
+              (when-let* ((window (split-window (selected-window) nil 'right)))
+                (set-window-buffer window buf)
+                (select-window window)))
+            (balance-windows))
+        (error
+         ;; If tiling blew up part-way through, drop the saved config so
+         ;; the next tap re-tries rather than restoring a half-built layout.
+         (setf (alist-get :show-all-window-config
+                          agent-shell-monome--state) nil)
+         (message "agent-shell-monome: show-all failed: %S" err))))))
+
+(defun agent-shell-monome--restore-window-config ()
+  "Restore the window configuration saved by `--show-all-agents'.
+Clears `:show-all-window-config' whether restore succeeds or fails, so
+the toggle's on/off state matches what the user sees on screen."
+  (let ((config (alist-get :show-all-window-config agent-shell-monome--state)))
+    (setf (alist-get :show-all-window-config agent-shell-monome--state) nil)
+    (when config
+      (condition-case err
+          (set-window-configuration config)
+        (error (message "agent-shell-monome: restore failed: %S" err))))))
 
 ;;; Favorites hotkey (project picker)
 
@@ -1502,12 +1575,37 @@ window or frame."
          (decayed (truncate (* acc agent-shell-monome-arc-decision-decay))))
     (setf (alist-get :decision-accumulator agent-shell-monome--state) decayed)))
 
+(defun agent-shell-monome--pending-for-selected ()
+  "Return `:pending-permissions' entries owned by the selected buffer.
+Filtered oldest-first from the global queue.  Empty when the selected
+buffer has no pending prompts, or when no buffer is selected -- ring 3
+must never answer a prompt raised by an off-screen shell."
+  (when-let* ((selected (agent-shell-monome--selected-buffer)))
+    (seq-filter (lambda (entry)
+                  (eq (alist-get :buffer entry) selected))
+                (alist-get :pending-permissions agent-shell-monome--state))))
+
+(defun agent-shell-monome--prune-permissions ()
+  "Drop pending permission entries whose owning buffer is dead.
+The idempotent responder closure keeps a reference to the buffer's
+state; once the buffer is killed the closure can no longer route a
+response anywhere useful, so leaving the entry around only pads the
+queue count on ring 3."
+  (setf (alist-get :pending-permissions agent-shell-monome--state)
+        (seq-filter (lambda (entry)
+                      (let ((buf (alist-get :buffer entry)))
+                        (or (null buf) (buffer-live-p buf))))
+                    (alist-get :pending-permissions agent-shell-monome--state))))
+
 (defun agent-shell-monome--decide (choice)
-  "Respond to the oldest pending permission with CHOICE (`allow' or `reject').
-Permissions are answered oldest-first: this pops the head of the
-`:pending-permissions' queue, so a second prompt arriving while the first
-is unanswered waits its turn instead of stealing the dial."
-  (when-let* ((queue (alist-get :pending-permissions agent-shell-monome--state))
+  "Respond to the oldest pending permission for the selected buffer with CHOICE.
+CHOICE is `allow' or `reject'.  Only prompts raised by
+`agent-shell-monome--selected-buffer' are eligible, so the dial can
+never answer a prompt in an off-screen shell by accident.  When several
+prompts are queued for the selected buffer, the oldest wins; other
+buffers' prompts stay untouched in the global queue for whenever they
+become the selection."
+  (when-let* ((queue (agent-shell-monome--pending-for-selected))
               (pending (car queue))
               (respond (alist-get :respond pending))
               (option-id (alist-get (if (eq choice 'allow) :allow-id :reject-id)
@@ -1515,20 +1613,24 @@ is unanswered waits its turn instead of stealing the dial."
     (condition-case err
         (funcall respond option-id)
       (error (message "agent-shell-monome: respond failed: %S" err)))
-    (setf (alist-get :pending-permissions agent-shell-monome--state) (cdr queue))
+    (setf (alist-get :pending-permissions agent-shell-monome--state)
+          (delq pending (alist-get :pending-permissions
+                                   agent-shell-monome--state)))
     (message "agent-shell-monome: sent %s" choice)))
 
 (defun agent-shell-monome--render-decision ()
   "Draw ring 3: left half fills on negative accumulator, right on positive.
-The ring is \"armed\" whenever a prompt is waiting; small dots clockwise of
-12 o'clock count how many more are queued behind the one being answered."
+The ring is \"armed\" whenever a prompt for the currently selected buffer
+is waiting; small dots clockwise of 12 o'clock count extras in that same
+buffer's queue.  Off-screen shells' prompts are intentionally invisible
+here so the dial reflects exactly what it will answer."
   (let* ((n agent-shell-monome-arc-decision-encoder)
          (acc (or (alist-get :decision-accumulator agent-shell-monome--state)
                   0))
          (threshold agent-shell-monome-arc-decision-threshold)
          (fraction (min 1.0 (/ (abs (float acc)) (max 1 threshold))))
          (span (max 1 (round (* 31 fraction))))
-         (queue (alist-get :pending-permissions agent-shell-monome--state))
+         (queue (agent-shell-monome--pending-for-selected))
          (pending (car queue))
          (base (if pending 3 0))
          (fill (round (+ 4 (* 11 fraction))))
@@ -1555,14 +1657,40 @@ The ring is \"armed\" whenever a prompt is waiting; small dots clockwise of
 
 ;;; Permission stash via responder function
 
+(defun agent-shell-monome--owner-buffer-for-request (request-id)
+  "Return the agent-shell buffer whose state holds a pending REQUEST-ID.
+`agent-shell--on-request' saves the tool call (with its
+`:permission-request-id') into the owning buffer's `:tool-calls' before
+invoking the responder, so scanning `agent-shell-buffers' for that id
+identifies the shell that raised this prompt.  Returns nil if none
+matches (e.g. the buffer was already killed) or when agent-shell is
+unavailable."
+  (when (and request-id
+             (fboundp 'agent-shell-buffers)
+             (fboundp 'agent-shell--state))
+    (seq-find (lambda (buffer)
+                (and (buffer-live-p buffer)
+                     (condition-case nil
+                         (with-current-buffer buffer
+                           (seq-some
+                            (lambda (entry)
+                              (equal request-id
+                                     (map-elt (cdr entry) :permission-request-id)))
+                            (map-elt (agent-shell--state) :tool-calls)))
+                       (error nil))))
+              (agent-shell-buffers))))
+
 (defun agent-shell-monome--responder (permission)
   "Enqueue PERMISSION's respond closure so ring 3 can answer it later.
-Appended to the tail of `:pending-permissions' so prompts are answered in
-arrival order (oldest first).  Returns nil so the normal interactive UI is
-still shown.  If a previous responder existed, chain to it and honor its
-return value."
+Appended to the tail of `:pending-permissions', tagged with the shell
+buffer that raised it (found via `--owner-buffer-for-request'), so the
+dial only ever answers prompts belonging to the currently selected
+buffer.  Returns nil so the normal interactive UI is still shown.  If a
+previous responder existed, chain to it and honor its return value."
   (let* ((options (alist-get :options permission))
          (tool-call (alist-get :tool-call permission))
+         (request-id (alist-get :permission-request-id tool-call))
+         (owner (agent-shell-monome--owner-buffer-for-request request-id))
          (allow-id (when-let ((o (seq-find
                                   (lambda (x)
                                     (equal (alist-get :kind x) "allow_once"))
@@ -1584,7 +1712,8 @@ return value."
                   (list (list (cons :respond idempotent)
                               (cons :allow-id allow-id)
                               (cons :reject-id reject-id)
-                              (cons :tool-call tool-call)))))
+                              (cons :tool-call tool-call)
+                              (cons :buffer owner)))))
     (when-let ((prev (alist-get :saved-responder agent-shell-monome--state))
                ((functionp prev)))
       (funcall prev permission))))
@@ -1799,9 +1928,11 @@ while held, so the arm state is visible without needing to look away."
 
 (defun agent-shell-monome--render-hotkeys (tick)
   "Refresh the reserved hotkey row LEDs at TICK.
-The delete key (bottom-right) and the favorites key (immediately left
-of it) are drawn dim (`agent-shell-monome-level-idle') when idle and
-pulse bright while their respective armed flags are set."
+Delete (bottom-right) and favorites (left of delete) are dim when idle
+and pulse bright while their armed flags are set (they are held
+modifiers).  Show-all (left of favorites) is a stateful toggle, not a
+held modifier, so it is drawn dim when off and steadily bright when
+its tiled view is active -- no pulse."
   (agent-shell-monome--render-hotkey-led
    (agent-shell-monome--delete-key-coord)
    (alist-get :delete-key-down agent-shell-monome--state)
@@ -1809,7 +1940,10 @@ pulse bright while their respective armed flags are set."
   (agent-shell-monome--render-hotkey-led
    (agent-shell-monome--favorites-key-coord)
    (alist-get :favorites-key-down agent-shell-monome--state)
-   tick))
+   tick)
+  (agent-shell-monome--render-hotkey-toggle-led
+   (agent-shell-monome--show-all-key-coord)
+   (alist-get :show-all-window-config agent-shell-monome--state)))
 
 (defun agent-shell-monome--render-hotkey-led (coord armed tick)
   "Paint a hotkey LED at COORD, pulsing at TICK when ARMED, else dim."
@@ -1819,6 +1953,12 @@ pulse bright while their respective armed flags are set."
        (if (< (mod tick 4) 2) 15 8)
      agent-shell-monome-level-idle)))
 
+(defun agent-shell-monome--render-hotkey-toggle-led (coord on)
+  "Paint a toggle hotkey LED at COORD: bright when ON, dim otherwise."
+  (agent-shell-monome--set-grid-led
+   (car coord) (cdr coord)
+   (if on 15 agent-shell-monome-level-idle)))
+
 (defun agent-shell-monome--render-arc ()
   "Refresh all arc rings from current state."
   (when (alist-get :arc-port agent-shell-monome--state)
@@ -1827,6 +1967,7 @@ pulse bright while their respective armed flags are set."
     (when (zerop (mod (or (alist-get :tick agent-shell-monome--state) 0) 50))
       (setf (alist-get :last-ring-maps agent-shell-monome--state) nil))
     (agent-shell-monome--decay-decision-accumulator)
+    (agent-shell-monome--prune-permissions)
     (agent-shell-monome--prune-tokens-subscriptions)
     (dolist (buffer (agent-shell-buffers))
       (agent-shell-monome--ensure-tokens-subscribed buffer))
@@ -1913,6 +2054,8 @@ pulse bright while their respective armed flags are set."
                 (cons :favorites-index 0)
                 (cons :favorites-scroll-accumulator 0)
                 (cons :favorites-window nil)
+                ;; Bottom-row show-all toggle
+                (cons :show-all-window-config nil)
                 ;; Hold-to-talk
                 (cons :htt-down-coord nil)
                 (cons :htt-timer nil)

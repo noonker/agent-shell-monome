@@ -161,42 +161,91 @@
       (should (eq 'reject fired)))))
 
 (ert-deftest agent-shell-monome--permissions-answered-oldest-first ()
-  ;; Two prompts arriving back-to-back both queue up, and ring 3 answers
-  ;; them in arrival order (oldest first) -- the second no longer steals
-  ;; the dial from the first.
+  ;; Two prompts for the *selected* buffer queue up in arrival order and
+  ;; ring 3 answers them oldest-first; a prompt from a different buffer
+  ;; is invisible to the dial so it can never be answered by accident.
   (let ((agent-shell-monome--state
          (list (cons :pending-permissions nil)
                (cons :saved-responder nil)))
         (fired nil))
-    (cl-flet ((perm (n)
-                (list (cons :options
-                            (list (list (cons :kind "allow_once")
-                                        (cons :option-id (format "allow-%d" n)))
-                                  (list (cons :kind "reject_once")
-                                        (cons :option-id (format "reject-%d" n)))))
-                      (cons :tool-call (format "tool-%d" n))
-                      (cons :respond (lambda (id) (push (cons n id) fired))))))
-      (agent-shell-monome--responder (perm 1))
-      (agent-shell-monome--responder (perm 2))
-      ;; Both queued, oldest (tool-1) at the head.
-      (should (= 2 (length (alist-get :pending-permissions
-                                      agent-shell-monome--state))))
-      (should (equal "tool-1"
-                     (alist-get :tool-call
-                                (car (alist-get :pending-permissions
-                                                agent-shell-monome--state)))))
-      ;; Allowing answers the oldest prompt with its allow option.
+    (cl-letf* (((symbol-function 'agent-shell-monome--selected-buffer)
+                (lambda () 'selected-buf))
+               ;; Route every incoming prompt to 'selected-buf except one
+               ;; tagged for 'other-buf, so we can prove foreign prompts
+               ;; stay untouched.
+               ((symbol-function 'agent-shell-monome--owner-buffer-for-request)
+                (lambda (id) (if (equal id "req-foreign") 'other-buf 'selected-buf))))
+      (cl-flet ((perm (n &optional foreign)
+                  (list (cons :options
+                              (list (list (cons :kind "allow_once")
+                                          (cons :option-id (format "allow-%d" n)))
+                                    (list (cons :kind "reject_once")
+                                          (cons :option-id (format "reject-%d" n)))))
+                        (cons :tool-call
+                              (list (cons :permission-request-id
+                                          (if foreign "req-foreign"
+                                            (format "req-%d" n)))))
+                        (cons :respond (lambda (id) (push (cons n id) fired))))))
+        (agent-shell-monome--responder (perm 1))
+        (agent-shell-monome--responder (perm 99 'foreign)) ;; other-buf
+        (agent-shell-monome--responder (perm 2))
+        ;; All three sit on the global queue; only two are for the selected buf.
+        (should (= 3 (length (alist-get :pending-permissions
+                                        agent-shell-monome--state))))
+        (should (= 2 (length (agent-shell-monome--pending-for-selected))))
+        ;; Allowing answers the selected buffer's oldest prompt.
+        (agent-shell-monome--decide 'allow)
+        (should (equal '(1 . "allow-1") (car fired)))
+        ;; The other-buf prompt was left in place, so 2 remain: one for
+        ;; other-buf and one still for selected-buf.
+        (should (= 2 (length (alist-get :pending-permissions
+                                        agent-shell-monome--state))))
+        (agent-shell-monome--decide 'reject)
+        (should (equal '(2 . "reject-2") (car fired)))
+        ;; Only the foreign prompt is left; ring 3 must not touch it.
+        (should (= 1 (length (alist-get :pending-permissions
+                                        agent-shell-monome--state))))
+        (should-not (agent-shell-monome--pending-for-selected))
+        ;; A decision with nothing eligible is a harmless no-op.
+        (agent-shell-monome--decide 'allow)
+        (should (= 2 (length fired)))))))
+
+(ert-deftest agent-shell-monome--decide-noop-when-no-selected-buffer ()
+  ;; With no selected shell (empty picker) ring 3 must not fire even if
+  ;; prompts are queued -- otherwise a random dial nudge could answer a
+  ;; prompt in a buffer the user cannot currently see.
+  (let ((agent-shell-monome--state
+         (list (cons :pending-permissions
+                     (list (list (cons :respond (lambda (_) (error "must not fire")))
+                                 (cons :allow-id "a")
+                                 (cons :reject-id "r")
+                                 (cons :buffer 'buf)))))))
+    (cl-letf (((symbol-function 'agent-shell-monome--selected-buffer)
+               (lambda () nil)))
       (agent-shell-monome--decide 'allow)
-      (should (equal '(1 . "allow-1") (car fired)))
-      (should (= 1 (length (alist-get :pending-permissions
-                                      agent-shell-monome--state))))
-      ;; The next decision answers the second prompt, then the queue drains.
       (agent-shell-monome--decide 'reject)
-      (should (equal '(2 . "reject-2") (car fired)))
-      (should-not (alist-get :pending-permissions agent-shell-monome--state))
-      ;; A decision with nothing queued is a harmless no-op.
-      (agent-shell-monome--decide 'allow)
-      (should (= 2 (length fired))))))
+      (should (= 1 (length (alist-get :pending-permissions
+                                      agent-shell-monome--state)))))))
+
+(ert-deftest agent-shell-monome--prune-permissions-drops-dead-owners ()
+  ;; Entries whose owner buffer is dead should be dropped so the ring-3
+  ;; backlog count reflects reachable prompts only.
+  (let* ((live (generate-new-buffer " *asm-live*"))
+         (dead (generate-new-buffer " *asm-dead*"))
+         (agent-shell-monome--state
+          (list (cons :pending-permissions
+                      (list (list (cons :buffer live))
+                            (list (cons :buffer dead))
+                            ;; Nil owner is tolerated: no lookup was
+                            ;; possible at enqueue time, so leave it.
+                            (list (cons :buffer nil)))))))
+    (unwind-protect
+        (progn
+          (kill-buffer dead)
+          (agent-shell-monome--prune-permissions)
+          (should (= 2 (length (alist-get :pending-permissions
+                                          agent-shell-monome--state)))))
+      (when (buffer-live-p live) (kill-buffer live)))))
 
 (ert-deftest agent-shell-monome--project-column-grouping ()
   ;; Two buffers in project A and one in project B should land in two
@@ -1053,6 +1102,123 @@ by the send-grid stub in these tests, most recent first."
   (let ((agent-shell-monome--state (list (cons :favorites-index 0)))
         (agent-shell-monome-favorite-projects nil))
     (should-not (agent-shell-monome--current-favorite))))
+
+;;;; Show-all hotkey (tile every agent-shell buffer)
+
+(ert-deftest agent-shell-monome--show-all-key-coord-third-from-right ()
+  ;; The show-all key must sit exactly two columns left of delete on the
+  ;; hotkey row (i.e. one column left of favorites), regardless of grid
+  ;; size, so counting from the right stays consistent as more hotkeys
+  ;; are added.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 16) (cons :grid-height 8))))
+    (should (equal (cons 13 7) (agent-shell-monome--show-all-key-coord)))
+    (should (agent-shell-monome--show-all-key-p 13 7))
+    (should-not (agent-shell-monome--show-all-key-p 14 7))
+    (should-not (agent-shell-monome--show-all-key-p 15 7))))
+
+(ert-deftest agent-shell-monome--show-all-toggles-on-then-off ()
+  ;; First tap tiles every live shell into its own window (snapshotting
+  ;; the pre-show config first); second tap restores the snapshotted
+  ;; config verbatim.  The bright/dim LED state follows the flag.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :show-all-window-config nil)))
+        (tiled nil)
+        (restored nil))
+    (cl-letf (((symbol-function 'agent-shell-buffers)
+               (lambda () '(a b c)))
+              ((symbol-function 'buffer-live-p) (lambda (_) t))
+              ((symbol-function 'current-window-configuration)
+               (lambda () 'saved-config))
+              ((symbol-function 'delete-other-windows) (lambda () nil))
+              ((symbol-function 'switch-to-buffer)
+               (lambda (b) (push (list 'switch b) tiled)))
+              ((symbol-function 'split-window)
+               (lambda (&rest _) 'new-window))
+              ((symbol-function 'set-window-buffer)
+               (lambda (_w b) (push (list 'set b) tiled)))
+              ((symbol-function 'select-window) (lambda (_w) nil))
+              ((symbol-function 'balance-windows) (lambda (&rest _) nil))
+              ((symbol-function 'set-window-configuration)
+               (lambda (c) (setq restored c))))
+      ;; First press: tile.
+      (agent-shell-monome--on-grid-key-down 1 3)
+      (should (eq 'saved-config
+                  (alist-get :show-all-window-config
+                             agent-shell-monome--state)))
+      ;; Each shell should have been shown once: first as switch-to-buffer,
+      ;; the rest as split + set-window-buffer.
+      (should (equal '(switch a) (car (last tiled))))
+      (should (memq 'b (mapcar #'cadr tiled)))
+      (should (memq 'c (mapcar #'cadr tiled)))
+      ;; Second press: restore the saved config exactly.
+      (agent-shell-monome--on-grid-key-down 1 3)
+      (should (eq 'saved-config restored))
+      (should-not (alist-get :show-all-window-config
+                             agent-shell-monome--state)))))
+
+(ert-deftest agent-shell-monome--show-all-noop-with-no-shells ()
+  ;; Tapping with no live agent-shell buffers must not touch the window
+  ;; layout, save nothing, and leave the toggle off.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :show-all-window-config nil))))
+    (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () nil))
+              ((symbol-function 'current-window-configuration)
+               (lambda () (error "must not snapshot when no shells")))
+              ((symbol-function 'delete-other-windows)
+               (lambda () (error "must not rearrange when no shells"))))
+      (agent-shell-monome--on-grid-key-down 1 3)
+      (should-not (alist-get :show-all-window-config
+                             agent-shell-monome--state)))))
+
+(ert-deftest agent-shell-monome--show-all-release-is-noop ()
+  ;; The key is tap-to-toggle (not held-modifier), so releases must not
+  ;; touch the show-all state -- otherwise the very release that
+  ;; completes the tap-on gesture would immediately toggle back off.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :show-all-window-config 'saved))))
+    (agent-shell-monome--on-grid-key-up 1 3)
+    (should (eq 'saved (alist-get :show-all-window-config
+                                  agent-shell-monome--state)))))
+
+(ert-deftest agent-shell-monome--show-all-led-bright-when-active ()
+  ;; Show-all's LED is dim (level-idle) when off and steadily bright when
+  ;; on -- no pulse, since it is a toggle rather than a held modifier.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :grid-prefix "/monome-grid")
+               (cons :last-leds nil)
+               (cons :delete-key-down nil)
+               (cons :favorites-key-down nil)
+               (cons :show-all-window-config nil)))
+        (agent-shell-monome-level-idle 2)
+        (sent nil))
+    (cl-letf (((symbol-function 'agent-shell-monome--send-grid)
+               (lambda (address args) (push (cons address args) sent))))
+      (agent-shell-monome--render-hotkeys 0)
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 1 3))))
+      ;; Activate: the LED goes to full brightness on the very next
+      ;; render, and stays there across tick phases (no pulse).
+      (setf (alist-get :show-all-window-config
+                       agent-shell-monome--state) 'saved)
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
+      (setq sent nil)
+      (agent-shell-monome--render-hotkeys 0)
+      (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                     sent (cons 1 3))))
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
+      (setq sent nil)
+      (agent-shell-monome--render-hotkeys 2)
+      (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                     sent (cons 1 3)))))))
 
 (provide 'agent-shell-monome-tests)
 ;;; agent-shell-monome-tests.el ends here
