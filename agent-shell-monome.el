@@ -51,6 +51,13 @@
 ;;   `whisper' package (https://github.com/natrys/whisper.el); see
 ;;   `agent-shell-monome-hold-to-talk' to disable.
 ;;
+;;   The bottom row is reserved for hotkeys and never holds a buffer.
+;;   The bottom-right key is a "delete" modifier: hold it and, while
+;;   held, tap a buffer's key to kill that buffer (which shuts down its
+;;   ACP client via `agent-shell--clean-up').  Releasing the delete key
+;;   without pressing a buffer key is a safe cancel.  The delete key is
+;;   drawn dim when idle and pulses bright while held.
+;;
 ;; Arc (uses the first 3 encoders):
 ;;   Ring 1 (selector) - one indicator LED per buffer at even spacing,
 ;;                       brightness reflects status, a brighter "pointer"
@@ -318,6 +325,11 @@ Top-level keys:
   :tap-reopen           - Buffer to submit (send ENTER) if the gesture
                           resolves to a tap, set only when the pressed key
                           is the already-open buffer's; nil otherwise.
+
+  ;; Bottom-row delete hotkey
+  :delete-key-down      - Non-nil while the bottom-right delete key is
+                          physically held.  A buffer-key press during this
+                          window kills that buffer instead of switching.
 
   ;; Hold-to-talk (voice input via whisper)
   :htt-down-coord       - (X . Y) of the key whose hold gesture is active,
@@ -661,6 +673,23 @@ project when COL is nil or owns no project yet."
         (error
          (message "agent-shell-monome: spawn failed: %S" err))))))
 
+(defun agent-shell-monome--hotkey-row ()
+  "Return the y-coordinate of the reserved hotkey row (the bottom row)."
+  (1- (or (alist-get :grid-height agent-shell-monome--state) 8)))
+
+(defun agent-shell-monome--hotkey-row-p (y)
+  "Return non-nil when Y is on the reserved hotkey row."
+  (= y (agent-shell-monome--hotkey-row)))
+
+(defun agent-shell-monome--delete-key-coord ()
+  "Return the (X . Y) of the delete hotkey (bottom-right key)."
+  (cons (1- (or (alist-get :grid-width agent-shell-monome--state) 8))
+        (agent-shell-monome--hotkey-row)))
+
+(defun agent-shell-monome--delete-key-p (x y)
+  "Return non-nil when (X, Y) is the delete hotkey coordinate."
+  (equal (cons x y) (agent-shell-monome--delete-key-coord)))
+
 (defun agent-shell-monome--on-grid-key (x y state)
   "Handle a grid key event at (X, Y) with STATE (1=down, 0=up)."
   (if (= state 1)
@@ -673,25 +702,60 @@ Switches to (or spawns) the buffer at that coordinate as before, and --
 for a bound, live buffer -- arms the hold-to-talk timer so a sustained
 hold begins recording.  It also records whether the key belongs to the
 already-open buffer so a tap (resolved on release) can submit an ENTER
-to it."
-  (let ((buffer (alist-get (cons x y)
-                           (alist-get :bindings agent-shell-monome--state)
-                           nil nil #'equal)))
-    (cond
-     ((and buffer (buffer-live-p buffer))
-      ;; Note "is this the open buffer?" *before* switching to it, so a tap
-      ;; on its own key can submit rather than be a no-op re-switch.
-      (setf (alist-get :tap-coord agent-shell-monome--state) (cons x y))
-      (setf (alist-get :tap-reopen agent-shell-monome--state)
-            (and agent-shell-monome-tap-open-sends-enter
-                 (eq buffer (window-buffer (selected-window)))
-                 buffer))
-      (pop-to-buffer buffer)
-      (agent-shell-monome--maybe-arm-hold (cons x y) buffer))
-     (buffer
-      (agent-shell-monome--prune-bindings))
-     (agent-shell-monome-spawn-on-empty-press
-      (agent-shell-monome--spawn-shell-here x)))))
+to it.
+
+The bottom row is reserved for hotkeys: the delete key (bottom-right)
+arms a kill gesture on press, and while it is held any buffer key press
+kills that buffer rather than switching to it.  Non-delete hotkey-row
+keys are currently ignored."
+  (cond
+   ;; Delete key pressed: enter kill-arm mode.  Do not switch, spawn, or
+   ;; arm hold-to-talk on the delete key itself.
+   ((agent-shell-monome--delete-key-p x y)
+    (setf (alist-get :delete-key-down agent-shell-monome--state) t))
+   ;; Other hotkey-row keys are reserved; no-op for now.
+   ((agent-shell-monome--hotkey-row-p y)
+    nil)
+   ;; Buffer key pressed with delete armed: kill it.  Skip switch/spawn
+   ;; and hold-to-talk so a delete gesture never leaves side effects
+   ;; (recording, prompt submit) behind.
+   ((alist-get :delete-key-down agent-shell-monome--state)
+    (agent-shell-monome--delete-buffer-at x y))
+   (t
+    (let ((buffer (alist-get (cons x y)
+                             (alist-get :bindings agent-shell-monome--state)
+                             nil nil #'equal)))
+      (cond
+       ((and buffer (buffer-live-p buffer))
+        ;; Note "is this the open buffer?" *before* switching to it, so a tap
+        ;; on its own key can submit rather than be a no-op re-switch.
+        (setf (alist-get :tap-coord agent-shell-monome--state) (cons x y))
+        (setf (alist-get :tap-reopen agent-shell-monome--state)
+              (and agent-shell-monome-tap-open-sends-enter
+                   (eq buffer (window-buffer (selected-window)))
+                   buffer))
+        (pop-to-buffer buffer)
+        (agent-shell-monome--maybe-arm-hold (cons x y) buffer))
+       (buffer
+        (agent-shell-monome--prune-bindings))
+       (agent-shell-monome-spawn-on-empty-press
+        (agent-shell-monome--spawn-shell-here x)))))))
+
+(defun agent-shell-monome--delete-buffer-at (x y)
+  "Kill the agent-shell buffer bound at (X, Y), if any.
+Suppresses `kill-buffer-query-functions' so the modal transcript-save
+prompt cannot pop up mid-OSC-filter and stall the bridge; the delete
+gesture is inherently deliberate (hold + tap).  A no-op when (X, Y) has
+no live binding."
+  (when-let* ((buffer (alist-get (cons x y)
+                                 (alist-get :bindings agent-shell-monome--state)
+                                 nil nil #'equal))
+              ((buffer-live-p buffer)))
+    (condition-case err
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer buffer))
+      (error (message "agent-shell-monome: delete failed: %S" err)))
+    (agent-shell-monome--prune-bindings)))
 
 (defun agent-shell-monome--on-grid-key-up (x y)
   "Handle a grid key release at (X, Y).
@@ -699,27 +763,37 @@ Resolves the gesture armed on key-down.  A hold past the threshold stops
 the in-progress hold-to-talk recording, triggering transcription and
 insertion.  A tap that began on the already-open buffer's own key submits
 an ENTER to it (see `agent-shell-monome-tap-open-sends-enter'); any other
-tap is just the buffer switch that already happened on key-down."
-  (let ((coord (cons x y))
-        ;; Capture before `--htt-end' clears it: a recording in flight means
-        ;; this release is a hold, not a tap, so it must not also submit.
-        (was-recording (alist-get :htt-recording agent-shell-monome--state)))
-    (when (equal coord (alist-get :htt-down-coord agent-shell-monome--state))
-      (if-let ((timer (alist-get :htt-timer agent-shell-monome--state)))
-          ;; Released before the threshold: a tap.  Recording never began.
-          (progn
-            (cancel-timer timer)
-            (setf (alist-get :htt-timer agent-shell-monome--state) nil)
-            (setf (alist-get :htt-down-coord agent-shell-monome--state) nil))
-        ;; Held past the threshold: recording is running -- stop it.
-        (agent-shell-monome--htt-end)))
-    (when (equal coord (alist-get :tap-coord agent-shell-monome--state))
-      (let ((reopen (alist-get :tap-reopen agent-shell-monome--state)))
-        (setf (alist-get :tap-coord agent-shell-monome--state) nil)
-        (setf (alist-get :tap-reopen agent-shell-monome--state) nil)
-        ;; A tap (not a hold) on the buffer that was already open submits it.
-        (when (and reopen (not was-recording) (buffer-live-p reopen))
-          (agent-shell-monome--send-enter reopen))))))
+tap is just the buffer switch that already happened on key-down.
+
+Releasing the delete hotkey disarms the kill gesture.  Releases of keys
+pressed while delete was armed have no tap/hold state to resolve, since
+key-down took the kill branch and set none."
+  (cond
+   ((agent-shell-monome--delete-key-p x y)
+    (setf (alist-get :delete-key-down agent-shell-monome--state) nil))
+   ((agent-shell-monome--hotkey-row-p y)
+    nil)
+   (t
+    (let ((coord (cons x y))
+          ;; Capture before `--htt-end' clears it: a recording in flight means
+          ;; this release is a hold, not a tap, so it must not also submit.
+          (was-recording (alist-get :htt-recording agent-shell-monome--state)))
+      (when (equal coord (alist-get :htt-down-coord agent-shell-monome--state))
+        (if-let ((timer (alist-get :htt-timer agent-shell-monome--state)))
+            ;; Released before the threshold: a tap.  Recording never began.
+            (progn
+              (cancel-timer timer)
+              (setf (alist-get :htt-timer agent-shell-monome--state) nil)
+              (setf (alist-get :htt-down-coord agent-shell-monome--state) nil))
+          ;; Held past the threshold: recording is running -- stop it.
+          (agent-shell-monome--htt-end)))
+      (when (equal coord (alist-get :tap-coord agent-shell-monome--state))
+        (let ((reopen (alist-get :tap-reopen agent-shell-monome--state)))
+          (setf (alist-get :tap-coord agent-shell-monome--state) nil)
+          (setf (alist-get :tap-reopen agent-shell-monome--state) nil)
+          ;; A tap (not a hold) on the buffer that was already open submits it.
+          (when (and reopen (not was-recording) (buffer-live-p reopen))
+            (agent-shell-monome--send-enter reopen))))))))
 
 (defun agent-shell-monome--send-enter (buffer)
   "Submit BUFFER's current prompt input, as if RET were pressed there.
@@ -887,10 +961,11 @@ Returns nil when every column is already taken by a different project."
   "Give each known agent-shell buffer a grid coordinate.
 Buffers sharing a project stack vertically in the same column.  Each
 project gets the lowest free column; new buffers within a project take
-the lowest free row in that column."
+the lowest free row in that column.  The bottom row is reserved for
+hotkeys and is never assigned to a buffer."
   (let* ((bindings (alist-get :bindings agent-shell-monome--state))
          (bound (mapcar #'cdr bindings))
-         (h (or (alist-get :grid-height agent-shell-monome--state) 8)))
+         (max-row (agent-shell-monome--hotkey-row)))
     (dolist (buffer (agent-shell-buffers))
       (unless (memq buffer bound)
         (when-let* ((project (agent-shell-monome--project-for-buffer buffer))
@@ -900,9 +975,9 @@ the lowest free row in that column."
                           (seq-filter (lambda (e) (= (car (car e)) col))
                                       bindings)))
                  (row 0))
-            (while (and (< row h) (member row rows-in-col))
+            (while (and (< row max-row) (member row rows-in-col))
               (setq row (1+ row)))
-            (when (< row h)
+            (when (< row max-row)
               (push (cons (cons col row) buffer) bindings))))))
     (setf (alist-get :bindings agent-shell-monome--state) bindings)))
 
@@ -1485,7 +1560,9 @@ thought-level control."
 (defun agent-shell-monome--render-grid ()
   "Refresh the grid LEDs from current state.
 The buffer currently being recorded into (hold-to-talk) blinks so the
-live mic is unmistakable; every other key reflects its buffer status."
+live mic is unmistakable; every other key reflects its buffer status.
+The bottom-right delete hotkey is drawn dim when idle and pulses bright
+while held, so the arm state is visible without needing to look away."
   (when (alist-get :grid-port agent-shell-monome--state)
     (agent-shell-monome--prune-bindings)
     (agent-shell-monome--prune-project-columns)
@@ -1497,7 +1574,20 @@ live mic is unmistakable; every other key reflects its buffer status."
          (car (car entry)) (cdr (car entry))
          (if (eq (cdr entry) recording)
              (if (< (mod tick 4) 2) 15 0)
-           (agent-shell-monome--level-for-buffer (cdr entry))))))))
+           (agent-shell-monome--level-for-buffer (cdr entry)))))
+      (agent-shell-monome--render-hotkeys tick))))
+
+(defun agent-shell-monome--render-hotkeys (tick)
+  "Refresh the reserved hotkey row LEDs at TICK.
+Only the bottom-right delete key is drawn: dim (`agent-shell-monome-level-idle')
+when idle, pulsing bright while `:delete-key-down' is set."
+  (let ((coord (agent-shell-monome--delete-key-coord))
+        (armed (alist-get :delete-key-down agent-shell-monome--state)))
+    (agent-shell-monome--set-grid-led
+     (car coord) (cdr coord)
+     (if armed
+         (if (< (mod tick 4) 2) 15 8)
+       agent-shell-monome-level-idle))))
 
 (defun agent-shell-monome--render-arc ()
   "Refresh all arc rings from current state."
@@ -1586,6 +1676,8 @@ live mic is unmistakable; every other key reflects its buffer status."
                 ;; Grid tap-to-submit
                 (cons :tap-coord nil)
                 (cons :tap-reopen nil)
+                ;; Bottom-row delete hotkey
+                (cons :delete-key-down nil)
                 ;; Hold-to-talk
                 (cons :htt-down-coord nil)
                 (cons :htt-timer nil)

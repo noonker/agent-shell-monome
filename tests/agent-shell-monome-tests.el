@@ -728,5 +728,158 @@
     (should (= 12.0 (alist-get :tokens-spinner-phase
                                agent-shell-monome--state)))))
 
+;;;; Bottom-row delete hotkey
+
+(ert-deftest agent-shell-monome--assign-skips-hotkey-row ()
+  ;; The bottom row is reserved for hotkeys, so the assigner must never
+  ;; place a buffer there even when it is the only row left in a column.
+  (let* ((agent-shell-monome--state
+          (list (cons :bindings nil)
+                (cons :project-columns nil)
+                (cons :grid-width 4)
+                (cons :grid-height 4))))
+    (cl-letf (((symbol-function 'agent-shell-buffers)
+               ;; Five buffers all in the same project would want rows
+               ;; 0..4 of column 0; with row 3 reserved only 3 fit.
+               (lambda () '(a b c d e)))
+              ((symbol-function 'buffer-live-p) (lambda (_) t))
+              ((symbol-function 'agent-shell-monome--project-for-buffer)
+               (lambda (_) "/proj")))
+      (agent-shell-monome--assign-new-buffers)
+      (let ((bindings (alist-get :bindings agent-shell-monome--state)))
+        (should (equal '(0 . 0) (car (rassq 'a bindings))))
+        (should (equal '(0 . 1) (car (rassq 'b bindings))))
+        (should (equal '(0 . 2) (car (rassq 'c bindings))))
+        ;; Row 3 is the hotkey row; d and e must not land there.
+        (should-not (rassq 'd bindings))
+        (should-not (rassq 'e bindings))
+        (should-not (seq-some (lambda (entry) (= 3 (cdr (car entry))))
+                              bindings))))))
+
+(ert-deftest agent-shell-monome--delete-key-coord-bottom-right ()
+  ;; The delete hotkey is the bottom-right cell of the reported grid,
+  ;; so its coordinate must track :grid-width/:grid-height rather than
+  ;; being hard-coded to an 8x8.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 16) (cons :grid-height 8))))
+    (should (equal (cons 15 7) (agent-shell-monome--delete-key-coord)))
+    (should (agent-shell-monome--delete-key-p 15 7))
+    (should-not (agent-shell-monome--delete-key-p 15 6))
+    (should-not (agent-shell-monome--delete-key-p 14 7))
+    (should (agent-shell-monome--hotkey-row-p 7))
+    (should-not (agent-shell-monome--hotkey-row-p 6))))
+
+(ert-deftest agent-shell-monome--delete-key-arm-and-disarm ()
+  ;; Pressing the delete hotkey sets :delete-key-down; releasing clears
+  ;; it -- and neither event should switch, spawn, or arm hold-to-talk.
+  (let ((agent-shell-monome--state
+         (list (cons :bindings nil)
+               (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :delete-key-down nil)
+               (cons :htt-down-coord nil)
+               (cons :tap-coord nil)))
+        (agent-shell-monome-hold-to-talk t)
+        (agent-shell-monome-spawn-on-empty-press t))
+    (cl-letf (((symbol-function 'pop-to-buffer)
+               (lambda (&rest _) (error "delete key must not switch")))
+              ((symbol-function 'agent-shell--new-shell)
+               (lambda (&rest _) (error "delete key must not spawn")))
+              ((symbol-function 'run-at-time)
+               (lambda (&rest _) (error "delete key must not arm hold"))))
+      (agent-shell-monome--on-grid-key 3 3 1)
+      (should (alist-get :delete-key-down agent-shell-monome--state))
+      (should-not (alist-get :tap-coord agent-shell-monome--state))
+      (should-not (alist-get :htt-down-coord agent-shell-monome--state))
+      (agent-shell-monome--on-grid-key 3 3 0)
+      (should-not (alist-get :delete-key-down agent-shell-monome--state)))))
+
+(ert-deftest agent-shell-monome--delete-plus-tap-kills-buffer ()
+  ;; With delete armed, tapping a bound key kills that buffer -- not
+  ;; switch, not spawn -- and does not leave a tap-coord/hold armed
+  ;; that a later release would try to resolve.
+  (let ((agent-shell-monome--state
+         (list (cons :bindings (list (cons (cons 0 0) 'buf)))
+               (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :delete-key-down t)
+               (cons :htt-down-coord nil)
+               (cons :tap-coord nil)))
+        (agent-shell-monome-hold-to-talk t)
+        (killed nil))
+    (cl-letf (((symbol-function 'buffer-live-p) (lambda (_) t))
+              ((symbol-function 'pop-to-buffer)
+               (lambda (&rest _) (error "delete gesture must not switch")))
+              ((symbol-function 'run-at-time)
+               (lambda (&rest _) (error "delete gesture must not arm hold")))
+              ((symbol-function 'kill-buffer)
+               (lambda (b) (setq killed b))))
+      (agent-shell-monome--on-grid-key 0 0 1)
+      (should (eq killed 'buf))
+      (should-not (alist-get :tap-coord agent-shell-monome--state))
+      (should-not (alist-get :htt-down-coord agent-shell-monome--state))
+      ;; The release of the buffer key should be a clean no-op --
+      ;; no tap/hold state was ever recorded.
+      (agent-shell-monome--on-grid-key 0 0 0))))
+
+(ert-deftest agent-shell-monome--delete-plus-empty-tap-does-nothing ()
+  ;; With delete armed, tapping an *unbound* key must not spawn a shell.
+  (let ((agent-shell-monome--state
+         (list (cons :bindings nil)
+               (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :delete-key-down t)))
+        (agent-shell-monome-spawn-on-empty-press t))
+    (cl-letf (((symbol-function 'agent-shell--new-shell)
+               (lambda (&rest _) (error "delete gesture must not spawn"))))
+      (agent-shell-monome--on-grid-key 1 1 1)
+      (agent-shell-monome--on-grid-key 1 1 0))))
+
+(ert-deftest agent-shell-monome--non-delete-hotkey-row-key-is-noop ()
+  ;; Other bottom-row keys are reserved for future hotkeys, so pressing
+  ;; one must not switch, spawn, or arm anything today.
+  (let ((agent-shell-monome--state
+         (list (cons :bindings nil)
+               (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :delete-key-down nil)))
+        (agent-shell-monome-spawn-on-empty-press t))
+    (cl-letf (((symbol-function 'agent-shell--new-shell)
+               (lambda (&rest _) (error "hotkey row must not spawn")))
+              ((symbol-function 'pop-to-buffer)
+               (lambda (&rest _) (error "hotkey row must not switch"))))
+      (agent-shell-monome--on-grid-key 0 3 1)
+      (agent-shell-monome--on-grid-key 0 3 0)
+      (should-not (alist-get :delete-key-down agent-shell-monome--state)))))
+
+(ert-deftest agent-shell-monome--render-hotkeys-pulses-when-armed ()
+  ;; Rendering must always paint the delete key (dim when idle) and
+  ;; pulse it when :delete-key-down is set, so the arm state is visible.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :grid-prefix "/monome-grid")
+               (cons :last-leds nil)
+               (cons :delete-key-down nil)))
+        (agent-shell-monome-level-idle 2)
+        (sent nil))
+    (cl-letf (((symbol-function 'agent-shell-monome--send-grid)
+               (lambda (address args) (push (cons address args) sent))))
+      ;; Idle: draw at level-idle.
+      (agent-shell-monome--render-hotkeys 0)
+      (should (equal '((i . 3) (i . 3) (i . 2))
+                     (cdr (car sent))))
+      (setq sent nil)
+      ;; Armed on the bright half of the pulse.
+      (setf (alist-get :delete-key-down agent-shell-monome--state) t)
+      (agent-shell-monome--render-hotkeys 0)
+      (should (equal '((i . 3) (i . 3) (i . 15))
+                     (cdr (car sent))))
+      (setq sent nil)
+      ;; Armed on the dim half of the pulse (tick 2 out of 4).
+      (agent-shell-monome--render-hotkeys 2)
+      (should (equal '((i . 3) (i . 3) (i . 8))
+                     (cdr (car sent)))))))
+
 (provide 'agent-shell-monome-tests)
 ;;; agent-shell-monome-tests.el ends here
