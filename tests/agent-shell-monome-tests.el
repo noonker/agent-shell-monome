@@ -919,9 +919,11 @@ by the send-grid stub in these tests, most recent first."
 (ert-deftest agent-shell-monome--render-hotkeys-pulses-when-armed ()
   ;; Both hotkeys draw dim when idle and pulse bright while their armed
   ;; flags are set, so the user always sees the arm state without
-  ;; needing to look away from the grid.
+  ;; needing to look away from the grid.  Uses an 8-wide grid so the
+  ;; delete (7) and favorites (6) coords are clear of the review keys
+  ;; sitting at (2) and (3).
   (let ((agent-shell-monome--state
-         (list (cons :grid-width 4)
+         (list (cons :grid-width 8)
                (cons :grid-height 4)
                (cons :grid-prefix "/monome-grid")
                (cons :last-leds nil)
@@ -939,18 +941,18 @@ by the send-grid stub in these tests, most recent first."
       ;; Idle: both hotkeys at level-idle.
       (agent-shell-monome--render-hotkeys 0)
       (should (= 2 (agent-shell-monome-tests--last-level-for-coord
-                    sent (cons 3 3))))
+                    sent (cons 7 3))))
       (should (= 2 (agent-shell-monome-tests--last-level-for-coord
-                    sent (cons 2 3))))
+                    sent (cons 6 3))))
       (setq sent nil)
       ;; Delete armed, favorites idle: only delete pulses.
       (setf (alist-get :delete-key-down agent-shell-monome--state) t)
       (setf (alist-get :last-leds agent-shell-monome--state) nil)
       (agent-shell-monome--render-hotkeys 0)
       (should (= 15 (agent-shell-monome-tests--last-level-for-coord
-                     sent (cons 3 3))))
+                     sent (cons 7 3))))
       (should (= 2 (agent-shell-monome-tests--last-level-for-coord
-                    sent (cons 2 3))))
+                    sent (cons 6 3))))
       (setq sent nil)
       ;; Favorites armed, delete idle: only favorites pulses.
       (setf (alist-get :delete-key-down agent-shell-monome--state) nil)
@@ -958,15 +960,15 @@ by the send-grid stub in these tests, most recent first."
       (setf (alist-get :last-leds agent-shell-monome--state) nil)
       (agent-shell-monome--render-hotkeys 0)
       (should (= 2 (agent-shell-monome-tests--last-level-for-coord
-                    sent (cons 3 3))))
+                    sent (cons 7 3))))
       (should (= 15 (agent-shell-monome-tests--last-level-for-coord
-                     sent (cons 2 3))))
+                     sent (cons 6 3))))
       (setq sent nil)
       ;; Dim half of the pulse (tick 2 of 4) for the armed favorites key.
       (setf (alist-get :last-leds agent-shell-monome--state) nil)
       (agent-shell-monome--render-hotkeys 2)
       (should (= 8 (agent-shell-monome-tests--last-level-for-coord
-                    sent (cons 2 3)))))))
+                    sent (cons 6 3)))))))
 
 ;;;; Favorites hotkey (project picker)
 
@@ -1536,6 +1538,220 @@ by the send-grid stub in these tests, most recent first."
                      sent (cons 0 3))))
       (should (= 15 (agent-shell-monome-tests--last-level-for-coord
                      sent (cons 1 3)))))))
+
+;;;; Magit review workflow (bottom-row back / forward pair)
+
+(ert-deftest agent-shell-monome--review-key-coords-are-central ()
+  ;; The review pair sits at columns 2 (back) and 3 (forward) on the
+  ;; hotkey row.  Fixed columns, so their positions don't depend on grid
+  ;; width -- on an 8-wide grid they land in the free slot between the
+  ;; allow/reject pair (0,1) and the right-side hotkeys (interrupt
+  ;; onward).
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 16) (cons :grid-height 8))))
+    (should (equal (cons 2 7) (agent-shell-monome--review-back-key-coord)))
+    (should (equal (cons 3 7) (agent-shell-monome--review-forward-key-coord)))
+    (should (agent-shell-monome--review-back-key-p 2 7))
+    (should (agent-shell-monome--review-forward-key-p 3 7))
+    (should-not (agent-shell-monome--review-back-key-p 3 7))
+    (should-not (agent-shell-monome--review-forward-key-p 2 7))))
+
+(ert-deftest agent-shell-monome--review-forward-dispatches-per-state ()
+  ;; Forward's meaning depends on the current phase: nil -> start,
+  ;; :review -> advance a hunk, :confirm -> enter commit, :commit ->
+  ;; finalize, :sync -> no-op (sync always runs to completion).  Stubs
+  ;; the phase handlers to capture which one gets called from the
+  ;; central dispatcher, so we're testing routing, not the phase logic
+  ;; itself.
+  (let ((agent-shell-monome--state (list (cons :review-state nil)))
+        (calls nil))
+    (cl-letf (((symbol-function 'agent-shell-monome--review-start)
+               (lambda () (push 'start calls)))
+              ((symbol-function 'agent-shell-monome--review-advance-hunk)
+               (lambda () (push 'advance calls)))
+              ((symbol-function 'agent-shell-monome--review-enter-commit)
+               (lambda () (push 'enter-commit calls)))
+              ((symbol-function 'agent-shell-monome--review-finalize-commit)
+               (lambda () (push 'finalize calls))))
+      (agent-shell-monome--review-forward)
+      (agent-shell-monome--set-review-state :review)
+      (agent-shell-monome--review-forward)
+      (agent-shell-monome--set-review-state :confirm)
+      (agent-shell-monome--review-forward)
+      (agent-shell-monome--set-review-state :commit)
+      (agent-shell-monome--review-forward)
+      (agent-shell-monome--set-review-state :sync)
+      (agent-shell-monome--review-forward))
+    (should (equal '(finalize enter-commit advance start)
+                   (seq-take calls 4)))))
+
+(ert-deftest agent-shell-monome--review-back-dispatches-per-state ()
+  ;; Back is a rewind: nil is a no-op (workflow starts on forward),
+  ;; :review walks back a hunk, :confirm returns to :review, :commit
+  ;; cancels and returns to :confirm, :sync is a no-op.
+  (let ((agent-shell-monome--state (list (cons :review-state nil)))
+        (calls nil))
+    (cl-letf (((symbol-function 'agent-shell-monome--review-retreat-hunk)
+               (lambda () (push 'retreat calls)))
+              ((symbol-function 'agent-shell-monome--review-back-to-review)
+               (lambda () (push 'back-to-review calls)))
+              ((symbol-function 'agent-shell-monome--review-cancel-commit)
+               (lambda () (push 'cancel-commit calls))))
+      (agent-shell-monome--review-back)  ;; nil -> nothing
+      (agent-shell-monome--set-review-state :review)
+      (agent-shell-monome--review-back)
+      (agent-shell-monome--set-review-state :confirm)
+      (agent-shell-monome--review-back)
+      (agent-shell-monome--set-review-state :commit)
+      (agent-shell-monome--review-back))
+    (should (equal '(cancel-commit back-to-review retreat) calls))))
+
+(ert-deftest agent-shell-monome--review-advance-past-end-enters-confirm ()
+  ;; When magit's `magit-section-forward' errors ("No next section"),
+  ;; the walker treats that as "end of the diff" and transitions to
+  ;; :confirm on the same tap -- so the user doesn't have to press
+  ;; twice at the boundary.
+  (let ((buf (generate-new-buffer " *asm-review-test*"))
+        (agent-shell-monome--state (list (cons :review-state :review))))
+    (unwind-protect
+        (progn
+          (setf (alist-get :review-magit-buffer agent-shell-monome--state)
+                buf)
+          (cl-letf (((symbol-function 'magit-section-forward)
+                     (lambda () (user-error "No next section"))))
+            (agent-shell-monome--review-advance-hunk))
+          (should (eq :confirm (agent-shell-monome--review-state))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest agent-shell-monome--confirm-allow-enters-commit-not-permission ()
+  ;; During :confirm the allow key must run the review's commit
+  ;; transition, not the pending-permission decision path (even if a
+  ;; prompt happens to be queued for the selected buffer).  Reject
+  ;; likewise aborts the review instead of rejecting the prompt.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 8)
+               (cons :grid-height 4)
+               (cons :bindings nil)
+               (cons :review-state :confirm)
+               (cons :pending-permissions
+                     (list (list (cons :allow-id "a")
+                                 (cons :reject-id "r")
+                                 (cons :respond (lambda (_) (error "nope")))
+                                 (cons :buffer 'sel))))))
+        (called nil))
+    (cl-letf (((symbol-function 'agent-shell-monome--selected-buffer)
+               (lambda () 'sel))
+              ((symbol-function 'agent-shell-monome--review-enter-commit)
+               (lambda () (push 'commit called)))
+              ((symbol-function 'agent-shell-monome--review-abort)
+               (lambda () (push 'abort called))))
+      (agent-shell-monome--on-grid-key-down 0 3)
+      (agent-shell-monome--set-review-state :confirm) ;; commit stub didn't touch it
+      (agent-shell-monome--on-grid-key-down 1 3))
+    (should (equal '(abort commit) called))))
+
+(ert-deftest agent-shell-monome--forward-tap-in-commit-runs-finalize ()
+  ;; With a captured commit buffer, pressing forward arms hold-to-talk;
+  ;; a quick release (timer still pending) resolves as a tap and calls
+  ;; --review-forward, which in :commit means finalize.  Uses a stub
+  ;; whisper (fboundp check gates the arm path).
+  (let* ((buf (generate-new-buffer " *asm-commit-test*"))
+         (agent-shell-monome--state
+          (list (cons :grid-width 8)
+                (cons :grid-height 4)
+                (cons :bindings nil)
+                (cons :review-state :commit)
+                (cons :review-commit-buffer buf)
+                (cons :htt-down-coord nil)
+                (cons :htt-timer nil)
+                (cons :htt-recording nil)))
+         (agent-shell-monome-hold-to-talk t)
+         (agent-shell-monome-hold-threshold 999)
+         (finalized nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'whisper-run) (lambda () nil))
+                  ((symbol-function 'agent-shell-monome--review-finalize-commit)
+                   (lambda () (push 'finalize finalized))))
+          (agent-shell-monome--on-grid-key-down 3 3)
+          (should (equal (cons 3 3)
+                         (alist-get :htt-down-coord
+                                    agent-shell-monome--state)))
+          (should (alist-get :htt-timer agent-shell-monome--state))
+          (agent-shell-monome--on-grid-key-up 3 3)
+          (should (equal '(finalize) finalized))
+          (should-not (alist-get :htt-down-coord
+                                 agent-shell-monome--state))
+          (should-not (alist-get :htt-timer agent-shell-monome--state)))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest agent-shell-monome--transcription-plain-insert-skips-shell-submit ()
+  ;; With :htt-plain-insert set (as the commit-message dictation path
+  ;; does), the transcription handler must ignore hold-to-talk-submit
+  ;; and just insert text at point-max -- calling shell-maker-submit on
+  ;; a non-shell buffer like COMMIT_EDITMSG would error.
+  (let* ((target (generate-new-buffer " *asm-plain-insert*"))
+         (agent-shell-monome--state
+          (list (cons :htt-target target)
+                (cons :htt-plain-insert t)))
+         (agent-shell-monome-hold-to-talk-submit t))
+    (unwind-protect
+        (cl-letf (((symbol-function 'shell-maker-submit)
+                   (lambda (&rest _)
+                     (error "shell-maker-submit must not be called"))))
+          (with-temp-buffer
+            (insert "  hello  ")
+            (agent-shell-monome--whisper-transcription-handler))
+          (with-current-buffer target
+            (should (equal "hello" (buffer-string))))
+          (should-not (alist-get :htt-plain-insert
+                                 agent-shell-monome--state)))
+      (when (buffer-live-p target) (kill-buffer target)))))
+
+(ert-deftest agent-shell-monome--review-leds-bright-when-active ()
+  ;; Both review LEDs are dim at level-idle when :review-state is nil
+  ;; and go steady bright once any review phase is running -- the pair
+  ;; is a visible marker of "review is in flight."  Forward pulses
+  ;; during commit-message dictation to signal the mic being live.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 8)
+               (cons :grid-height 4)
+               (cons :grid-prefix "/monome-grid")
+               (cons :last-leds nil)
+               (cons :review-state nil)
+               (cons :htt-recording nil)))
+        (agent-shell-monome-level-idle 2)
+        (sent nil))
+    (cl-letf (((symbol-function 'agent-shell-monome--send-grid)
+               (lambda (address args) (push (cons address args) sent))))
+      ;; Idle.
+      (agent-shell-monome--render-review-leds 0)
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 2 3))))
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 3 3))))
+      ;; Active (any non-nil state).
+      (setf (alist-get :review-state agent-shell-monome--state) :review)
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
+      (setq sent nil)
+      (agent-shell-monome--render-review-leds 0)
+      (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                     sent (cons 2 3))))
+      (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                     sent (cons 3 3))))
+      ;; Commit + recording: forward pulses; tick 2 lands in the dark
+      ;; half of the pulse.
+      (setf (alist-get :review-state agent-shell-monome--state) :commit)
+      (setf (alist-get :htt-recording agent-shell-monome--state) 'buf)
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
+      (setq sent nil)
+      (agent-shell-monome--render-review-leds 0)
+      (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                     sent (cons 3 3))))
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
+      (setq sent nil)
+      (agent-shell-monome--render-review-leds 2)
+      (should (= 0 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 3 3)))))))
 
 (provide 'agent-shell-monome-tests)
 ;;; agent-shell-monome-tests.el ends here

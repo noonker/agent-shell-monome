@@ -89,6 +89,22 @@
 ;;   buffer for the same reason as ring 3: the physical keys must never
 ;;   answer a prompt raised by an off-screen shell.
 ;;
+;;   The two central keys (x=2 back, x=3 forward) walk a magit review
+;;   workflow.  From idle, forward opens `magit-status' at the selected
+;;   shell's cwd and enters :review; back/forward then walk sections
+;;   the same way `n' / `p' do in magit.  Walking past the last section
+;;   drops into :confirm, where the allow / reject keys are hijacked to
+;;   answer "Look good?" (allow -> commit, reject -> abort).  Allow
+;;   opens the commit buffer (:commit); hold forward to dictate a
+;;   commit message via whisper, tap forward to finalize (which runs
+;;   `with-editor-finish' and drops into :sync).  Sync is a two-step
+;;   async pull --rebase then push chain that always runs to
+;;   completion; the state resets to idle when the second process
+;;   settles regardless of exit status.  Both back/forward LEDs are dim
+;;   when idle and steady bright while a review is active; forward
+;;   pulses during commit-message dictation, matching how buffer keys
+;;   blink during hold-to-talk recording.
+;;
 ;; Arc (uses the first 3 encoders):
 ;;   Ring 1 (selector) - one indicator LED per buffer at even spacing,
 ;;                       brightness reflects status, a brighter "pointer"
@@ -126,9 +142,16 @@
 (declare-function shell-maker-submit "shell-maker")
 (declare-function somafm-player-volume-down "somafm" (arg))
 (declare-function somafm-player-volume-up "somafm" (arg))
+(declare-function magit-status "magit-status" (&optional directory cache))
+(declare-function magit-section-forward "magit-section")
+(declare-function magit-section-backward "magit-section")
+(declare-function magit-commit-create "magit-commit" (&optional args))
+(declare-function with-editor-finish "with-editor" (force))
+(declare-function with-editor-cancel "with-editor" (force))
 (defvar agent-shell-permission-responder-function)
 (defvar whisper-insert-text-at-point)
 (defvar whisper-after-transcription-hook)
+(defvar git-commit-setup-hook)
 
 ;;; Customization
 
@@ -421,6 +444,21 @@ Top-level keys:
                                  show-all toggle is turned off, or nil
                                  when show-all is currently inactive.
 
+  ;; Bottom-row magit review workflow
+  :review-state          - Current phase of the review state machine or nil
+                           when idle.  Values: :review, :confirm, :commit,
+                           :sync.  Walked by the two central hotkeys.
+  :review-repo-root      - Git working tree the workflow is pinned to,
+                           captured on start so focus wandering can't
+                           redirect the pull/push at the tail.
+  :review-magit-buffer   - The `magit-status' buffer opened by --review-start,
+                           so back/forward can navigate it directly.
+  :review-commit-buffer  - COMMIT_EDITMSG buffer captured via
+                           `git-commit-setup-hook' after `:commit' is
+                           entered; hold-to-talk dictates into it and
+                           the tap-to-finalize path calls
+                           `with-editor-finish' on it.
+
   ;; Hold-to-talk (voice input via whisper)
   :htt-down-coord       - (X . Y) of the key whose hold gesture is active,
                           or nil.  Matched on release to resolve tap vs hold.
@@ -430,6 +468,11 @@ Top-level keys:
                           Its grid key blinks while set.
   :htt-target           - Buffer to insert the transcription into, read by
                           the `whisper-after-transcription-hook' handler.
+  :htt-plain-insert     - When non-nil, the transcription-handler skips the
+                          shell-maker submit path and just inserts at
+                          point-max in :htt-target.  Set by the review
+                          workflow so commit-message dictation lands in a
+                          non-shell buffer without erroring on submit.
   :htt-somafm-ducked    - Steps applied to `somafm-player-volume-down'
                           when the recording started, or nil when the
                           volume is at rest.  Unduck feeds this same
@@ -829,6 +872,22 @@ project when COL is nil or owns no project yet."
   "Return non-nil when (X, Y) is the permission-reject hotkey coordinate."
   (equal (cons x y) (agent-shell-monome--reject-key-coord)))
 
+(defun agent-shell-monome--review-back-key-coord ()
+  "Return the (X . Y) of the review-back hotkey (third column from left)."
+  (cons 2 (agent-shell-monome--hotkey-row)))
+
+(defun agent-shell-monome--review-back-key-p (x y)
+  "Return non-nil when (X, Y) is the review-back hotkey coordinate."
+  (equal (cons x y) (agent-shell-monome--review-back-key-coord)))
+
+(defun agent-shell-monome--review-forward-key-coord ()
+  "Return the (X . Y) of the review-forward hotkey (fourth column from left)."
+  (cons 3 (agent-shell-monome--hotkey-row)))
+
+(defun agent-shell-monome--review-forward-key-p (x y)
+  "Return non-nil when (X, Y) is the review-forward hotkey coordinate."
+  (equal (cons x y) (agent-shell-monome--review-forward-key-coord)))
+
 (defun agent-shell-monome--on-grid-key (x y state)
   "Handle a grid key event at (X, Y) with STATE (1=down, 0=up)."
   (if (= state 1)
@@ -850,7 +909,9 @@ key (third from the right) toggles a tiled view of every live
 agent-shell buffer, the interrupt key (fourth from the right) fires
 `agent-shell-interrupt' on the selected shell, the two leftmost keys
 answer the selected shell's oldest pending permission prompt (x=0
-allow, x=1 reject), and any other bottom-row key is a no-op for now."
+allow, x=1 reject), the two central keys (x=2 back, x=3 forward) walk
+a magit review workflow (see the top-of-file commentary), and any
+other bottom-row key is a no-op for now."
   (cond
    ;; Delete key pressed: enter kill-arm mode.  Do not switch, spawn, or
    ;; arm hold-to-talk on the delete key itself.
@@ -870,15 +931,33 @@ allow, x=1 reject), and any other bottom-row key is a no-op for now."
    ;; request and reject any pending permissions there.
    ((agent-shell-monome--interrupt-key-p x y)
     (agent-shell-monome--interrupt-selected))
-   ;; Allow / reject hotkeys: answer the oldest pending permission for
-   ;; the selected buffer.  `--decide' no-ops when the queue is empty,
-   ;; so an accidental press with nothing waiting is harmless.  Scoped
-   ;; to the selected buffer for the same reason ring 3 is: the physical
-   ;; key must never answer a prompt raised by an off-screen shell.
+   ;; Allow / reject hotkeys.  During `:confirm' the review workflow
+   ;; hijacks them to answer "Look good?" (allow=commit, reject=abort);
+   ;; the pending-permission path only sees them when no review is
+   ;; asking.  Outside `:confirm', `--decide' no-ops on an empty queue,
+   ;; so an accidental press with nothing waiting stays harmless.
+   ;; Scoped to the selected buffer for the same reason ring 3 is: the
+   ;; physical key must never answer a prompt raised by an off-screen
+   ;; shell.
    ((agent-shell-monome--allow-key-p x y)
-    (agent-shell-monome--decide 'allow))
+    (if (eq (agent-shell-monome--review-state) :confirm)
+        (agent-shell-monome--review-enter-commit)
+      (agent-shell-monome--decide 'allow)))
    ((agent-shell-monome--reject-key-p x y)
-    (agent-shell-monome--decide 'reject))
+    (if (eq (agent-shell-monome--review-state) :confirm)
+        (agent-shell-monome--review-abort)
+      (agent-shell-monome--decide 'reject)))
+   ;; Review-forward: state-machine advance.  When we are in `:commit',
+   ;; arm hold-to-talk against the captured commit buffer so a long
+   ;; press dictates and a tap finalizes -- the tap is resolved on
+   ;; key-up (see `--on-grid-key-up`).
+   ((agent-shell-monome--review-forward-key-p x y)
+    (if (and (eq (agent-shell-monome--review-state) :commit)
+             (alist-get :review-commit-buffer agent-shell-monome--state))
+        (agent-shell-monome--review-arm-commit-hold (cons x y))
+      (agent-shell-monome--review-forward)))
+   ((agent-shell-monome--review-back-key-p x y)
+    (agent-shell-monome--review-back))
    ;; Other hotkey-row keys are reserved; no-op for now.
    ((agent-shell-monome--hotkey-row-p y)
     nil)
@@ -1218,6 +1297,25 @@ tap/hold state to resolve, since key-down took the hotkey branch."
       (setf (alist-get :favorites-key-down agent-shell-monome--state) nil)
       (agent-shell-monome--hide-favorites)
       (agent-shell-monome--spawn-shell-at root)))
+   ;; Review-forward release: resolve tap vs. hold when we armed HTT on
+   ;; the way down (commit-state dictation).  A quick release means the
+   ;; timer never fired -- treat that as an advance tap.  A long
+   ;; release means recording started and must be stopped.  When we
+   ;; didn't arm anything (down took the plain state-machine branch),
+   ;; the release is a no-op like the other hotkey-row catchall.
+   ((agent-shell-monome--review-forward-key-p x y)
+    (let ((coord (cons x y)))
+      (when (equal coord (alist-get :htt-down-coord
+                                    agent-shell-monome--state))
+        (if-let ((timer (alist-get :htt-timer agent-shell-monome--state)))
+            (progn
+              (cancel-timer timer)
+              (setf (alist-get :htt-timer agent-shell-monome--state) nil)
+              (setf (alist-get :htt-down-coord
+                               agent-shell-monome--state) nil)
+              ;; Tap resolution: finalize the commit.
+              (agent-shell-monome--review-forward))
+          (agent-shell-monome--htt-end)))))
    ((agent-shell-monome--hotkey-row-p y)
     nil)
    (t
@@ -1352,13 +1450,16 @@ flight, so it is safe to call from any hold-to-talk cleanup path."
         (error (message "agent-shell-monome: somafm unduck failed: %S"
                         err))))))
 
-(defun agent-shell-monome--insert-transcription (buffer text)
+(defun agent-shell-monome--insert-transcription (buffer text &optional plain)
   "Insert TEXT at BUFFER's shell prompt, submitting when configured.
 With `agent-shell-monome-hold-to-talk-submit' non-nil the text is sent
 via `shell-maker-submit'; otherwise it is appended to the prompt input
-for review."
+for review.  When PLAIN is non-nil (used by the magit review workflow
+to dictate into a commit-message buffer) the shell-submit path is
+skipped unconditionally and the text is just inserted at point-max."
   (with-current-buffer buffer
-    (if (and agent-shell-monome-hold-to-talk-submit
+    (if (and (not plain)
+             agent-shell-monome-hold-to-talk-submit
              (fboundp 'shell-maker-submit))
         (shell-maker-submit :input text)
       (goto-char (point-max))
@@ -1374,14 +1475,16 @@ the target buffer's prompt.  A no-op otherwise, leaving ordinary
 `whisper-run' usage untouched."
   (when-let ((target (and agent-shell-monome--state
                           (alist-get :htt-target agent-shell-monome--state))))
-    (let ((text (string-trim (buffer-string))))
+    (let ((text (string-trim (buffer-string)))
+          (plain (alist-get :htt-plain-insert agent-shell-monome--state)))
       (setf (alist-get :htt-target agent-shell-monome--state) nil)
+      (setf (alist-get :htt-plain-insert agent-shell-monome--state) nil)
       ;; Emptying the stdout buffer leaves whisper nothing to insert at
       ;; point, so the transcription lands only where we put it.
       (erase-buffer)
       (when (and (not (string-empty-p text)) (buffer-live-p target))
         (condition-case err
-            (agent-shell-monome--insert-transcription target text)
+            (agent-shell-monome--insert-transcription target text plain)
           (error (message "agent-shell-monome: insert failed: %S" err)))))))
 
 (defun agent-shell-monome--coord-for-slot (slot)
@@ -1917,6 +2020,279 @@ previous responder existed, chain to it and honor its return value."
                ((functionp prev)))
       (funcall prev permission))))
 
+;;; Magit review workflow (bottom-row back/forward pair)
+;;
+;; A tiny state machine walked by the two central hotkeys (x=2 back,
+;; x=3 forward) that drives an entire review-and-push in physical
+;; gestures.  Enters `:review' from idle by opening `magit-status' at
+;; the selected agent-shell's cwd; back/forward walk the diff sections
+;; the same way magit's own `n' / `p' do.  Walking off the end lands
+;; on `:confirm', where the pre-existing allow/reject keys are hijacked
+;; to answer "Look good?".  Allow advances to `:commit', which pops the
+;; commit buffer; hold the forward key to dictate a message via whisper
+;; (routes through the existing hold-to-talk plumbing with an
+;; alternative insert path so the shell-submit code stays out) and tap
+;; forward to finalize with `with-editor-finish'.  That drops into
+;; `:sync', a two-step async pull-then-push chain; per the design there
+;; is no way to abort it once started -- the state resets when both
+;; processes settle.
+
+(defcustom agent-shell-monome-review-git-executable "git"
+  "Executable used for the pull/push steps of the review workflow."
+  :type 'string)
+
+(defun agent-shell-monome--review-state ()
+  "Return the current review state symbol (or nil)."
+  (alist-get :review-state agent-shell-monome--state))
+
+(defun agent-shell-monome--set-review-state (state)
+  "Set the current review state to STATE (a symbol or nil)."
+  (setf (alist-get :review-state agent-shell-monome--state) state))
+
+(defun agent-shell-monome--review-repo-root ()
+  "Return the repo root the current review is (or would be) rooted at.
+Falls back to the selected agent-shell buffer's `default-directory'
+since a running review pins it in `:review-repo-root'."
+  (or (alist-get :review-repo-root agent-shell-monome--state)
+      (when-let* ((buffer (agent-shell-monome--selected-buffer))
+                  ((buffer-live-p buffer)))
+        (buffer-local-value 'default-directory buffer))))
+
+(defun agent-shell-monome--review-forward ()
+  "Dispatch a forward-key tap to the current review state.
+From idle, starts the workflow.  Within a state, advances it: walking
+hunks in `:review', asking `:confirm', finalizing in `:commit', or
+no-op during `:sync' (which the user asked to always run to
+completion)."
+  (pcase (agent-shell-monome--review-state)
+    ('nil       (agent-shell-monome--review-start))
+    (:review    (agent-shell-monome--review-advance-hunk))
+    (:confirm   (agent-shell-monome--review-enter-commit))
+    (:commit    (agent-shell-monome--review-finalize-commit))
+    (:sync      (message "agent-shell-monome: sync in flight; wait"))))
+
+(defun agent-shell-monome--review-back ()
+  "Dispatch a back-key tap to the current review state.
+From idle, no-op (the workflow only starts on forward).  In `:review',
+walks a hunk backwards; in `:confirm', drops back to `:review' for
+another look; in `:commit', cancels the commit buffer and returns to
+`:confirm'; no-op in `:sync'."
+  (pcase (agent-shell-monome--review-state)
+    ('nil       nil)
+    (:review    (agent-shell-monome--review-retreat-hunk))
+    (:confirm   (agent-shell-monome--review-back-to-review))
+    (:commit    (agent-shell-monome--review-cancel-commit))
+    (:sync      (message "agent-shell-monome: sync in flight; wait"))))
+
+(defun agent-shell-monome--review-abort ()
+  "Tear down any active review workflow and reset to idle.
+Kills the magit-status buffer we opened but leaves any commit or
+process buffers alone (they may still contain work the user cares
+about).  Safe to call from any state."
+  (when-let ((buf (alist-get :review-magit-buffer
+                             agent-shell-monome--state)))
+    (when (buffer-live-p buf)
+      (let ((kill-buffer-query-functions nil))
+        (ignore-errors (kill-buffer buf)))))
+  (setf (alist-get :review-magit-buffer agent-shell-monome--state) nil)
+  (setf (alist-get :review-commit-buffer agent-shell-monome--state) nil)
+  (setf (alist-get :review-repo-root agent-shell-monome--state) nil)
+  (agent-shell-monome--set-review-state nil)
+  (message "agent-shell-monome: review aborted"))
+
+(defun agent-shell-monome--review-start ()
+  "Enter `:review' by opening magit-status at the selected shell's cwd.
+Guards: magit must be loadable, the directory must be a git working
+tree.  On success stashes the magit buffer and repo root so the rest of
+the workflow always operates on the same repo even if focus wanders."
+  (let* ((root (agent-shell-monome--review-repo-root)))
+    (cond
+     ((null root)
+      (message "agent-shell-monome: no selected shell; can't review"))
+     ((not (require 'magit nil t))
+      (message "agent-shell-monome: magit not available"))
+     ((not (file-directory-p (expand-file-name ".git" root)))
+      ;; A worktree/submodule/detached checkout would need magit's own
+      ;; toplevel discovery; keep the trigger conservative and let the
+      ;; user open magit manually in that case.
+      (message "agent-shell-monome: %s is not a git working tree" root))
+     (t
+      (setf (alist-get :review-repo-root agent-shell-monome--state) root)
+      (let ((default-directory root))
+        (magit-status root))
+      (setf (alist-get :review-magit-buffer agent-shell-monome--state)
+            (current-buffer))
+      (agent-shell-monome--set-review-state :review)
+      (message "agent-shell-monome: review started (forward=next, back=prev)")))))
+
+(defun agent-shell-monome--review-with-magit-buffer (body)
+  "Run BODY inside the review's magit-status buffer, if it is still live.
+Returns whatever BODY returns, or nil when the buffer is gone."
+  (when-let ((buf (alist-get :review-magit-buffer
+                             agent-shell-monome--state))
+             ((buffer-live-p buf)))
+    (with-current-buffer buf
+      (funcall body))))
+
+(defun agent-shell-monome--review-advance-hunk ()
+  "Move forward one section in the review buffer.
+When there is no next section (magit signals `user-error'), transition
+to `:confirm' so the same forward tap that ran off the end becomes the
+`Look good?' prompt."
+  (let ((advanced (agent-shell-monome--review-with-magit-buffer
+                   (lambda ()
+                     (condition-case nil
+                         (progn (magit-section-forward) t)
+                       (user-error nil))))))
+    (unless advanced
+      (agent-shell-monome--review-enter-confirm))))
+
+(defun agent-shell-monome--review-retreat-hunk ()
+  "Move backward one section in the review buffer, or bail out on the first."
+  (agent-shell-monome--review-with-magit-buffer
+   (lambda ()
+     (condition-case nil
+         (magit-section-backward)
+       (user-error
+        (message "agent-shell-monome: at top of review"))))))
+
+(defun agent-shell-monome--review-enter-confirm ()
+  "Move from `:review' to `:confirm' and prompt via the allow/reject keys."
+  (agent-shell-monome--set-review-state :confirm)
+  (message "agent-shell-monome: look good?  allow=commit, reject=abort"))
+
+(defun agent-shell-monome--review-back-to-review ()
+  "Drop from `:confirm' back into `:review' for another pass."
+  (agent-shell-monome--set-review-state :review)
+  (message "agent-shell-monome: back to review"))
+
+(defun agent-shell-monome--review-enter-commit ()
+  "Move from `:confirm' into `:commit' by opening the commit buffer.
+Attaches a one-shot function to `git-commit-setup-hook' that captures
+the commit buffer's identity so hold-to-talk knows where to route
+transcriptions.  The hook removes itself once fired."
+  (let ((root (alist-get :review-repo-root agent-shell-monome--state)))
+    (cond
+     ((null root)
+      (message "agent-shell-monome: no repo root; aborting")
+      (agent-shell-monome--review-abort))
+     (t
+      (agent-shell-monome--set-review-state :commit)
+      (let* ((capture nil)
+             (hook (lambda ()
+                     (setf (alist-get :review-commit-buffer
+                                      agent-shell-monome--state)
+                           (current-buffer))
+                     (remove-hook 'git-commit-setup-hook capture))))
+        (setq capture hook)
+        (add-hook 'git-commit-setup-hook capture))
+      (let ((default-directory root))
+        (condition-case err
+            (magit-commit-create nil)
+          (error
+           (message "agent-shell-monome: commit failed: %S" err)
+           (agent-shell-monome--review-abort))))))))
+
+(defun agent-shell-monome--review-finalize-commit ()
+  "Run `with-editor-finish' in the captured commit buffer, then start sync."
+  (let ((buf (alist-get :review-commit-buffer agent-shell-monome--state)))
+    (cond
+     ((not (and buf (buffer-live-p buf)))
+      (message "agent-shell-monome: commit buffer gone; aborting")
+      (agent-shell-monome--review-abort))
+     (t
+      (with-current-buffer buf
+        (condition-case err
+            (with-editor-finish nil)
+          (error
+           (message "agent-shell-monome: finish failed: %S" err)
+           (agent-shell-monome--review-abort))))
+      (setf (alist-get :review-commit-buffer agent-shell-monome--state) nil)
+      (agent-shell-monome--review-enter-sync)))))
+
+(defun agent-shell-monome--review-cancel-commit ()
+  "Kill the commit buffer via `with-editor-cancel' and drop back to `:confirm'."
+  (let ((buf (alist-get :review-commit-buffer agent-shell-monome--state)))
+    (when (and buf (buffer-live-p buf))
+      (with-current-buffer buf
+        (ignore-errors (with-editor-cancel nil))))
+    (setf (alist-get :review-commit-buffer agent-shell-monome--state) nil))
+  (agent-shell-monome--set-review-state :confirm)
+  (message "agent-shell-monome: commit cancelled; still at look good?"))
+
+(defun agent-shell-monome--review-arm-commit-hold (coord)
+  "Arm the hold-to-talk timer against the commit buffer at COORD.
+Reuses the ordinary HTT plumbing so timing, whisper start/stop, and
+somafm ducking all match the buffer-key experience.  Sets
+`:htt-plain-insert' so the transcription-handler skips the shell submit
+path -- the commit buffer isn't shell-maker, and running submit would
+error.  The key-up handler resolves tap vs. hold and calls either
+`--review-forward' (tap: finalize) or `--htt-end' (hold: stop
+recording)."
+  (let ((buffer (alist-get :review-commit-buffer agent-shell-monome--state)))
+    (when (and buffer (buffer-live-p buffer)
+               agent-shell-monome-hold-to-talk
+               (fboundp 'whisper-run)
+               (null (alist-get :htt-down-coord agent-shell-monome--state))
+               (null (alist-get :htt-recording agent-shell-monome--state)))
+      (setf (alist-get :htt-plain-insert agent-shell-monome--state) t)
+      (setf (alist-get :htt-down-coord agent-shell-monome--state) coord)
+      (setf (alist-get :htt-timer agent-shell-monome--state)
+            (run-at-time agent-shell-monome-hold-threshold nil
+                         #'agent-shell-monome--htt-begin buffer)))))
+
+(defun agent-shell-monome--review-enter-sync ()
+  "Kick off a pull --rebase then a push, both async.
+Per the design decision, sync always runs to completion once entered;
+the state resets after the second process settles regardless of exit
+status, so a failed push still returns the workflow to idle rather
+than stranding it at `:sync' forever.  Both processes' output goes to
+buffers named after the step so the user can inspect them."
+  (agent-shell-monome--set-review-state :sync)
+  (let* ((root (alist-get :review-repo-root agent-shell-monome--state))
+         (git agent-shell-monome-review-git-executable)
+         (default-directory root))
+    (agent-shell-monome--review-run-async
+     git '("pull" "--rebase") "*asm-review-pull*"
+     (lambda (pull-ok)
+       (if (not pull-ok)
+           (progn
+             (message "agent-shell-monome: pull --rebase failed; sync stopped")
+             (agent-shell-monome--review-sync-done))
+         (let ((default-directory root))
+           (agent-shell-monome--review-run-async
+            git '("push") "*asm-review-push*"
+            (lambda (push-ok)
+              (message (if push-ok
+                           "agent-shell-monome: pull + push done"
+                         "agent-shell-monome: push failed"))
+              (agent-shell-monome--review-sync-done)))))))))
+
+(defun agent-shell-monome--review-sync-done ()
+  "Reset review state after the sync chain finishes (success or not)."
+  (setf (alist-get :review-repo-root agent-shell-monome--state) nil)
+  (setf (alist-get :review-magit-buffer agent-shell-monome--state) nil)
+  (agent-shell-monome--set-review-state nil))
+
+(defun agent-shell-monome--review-run-async (program args buffer-name on-done)
+  "Run PROGRAM ARGS async into BUFFER-NAME, call ON-DONE with a success bool."
+  (let ((buf (get-buffer-create buffer-name)))
+    (with-current-buffer buf (erase-buffer))
+    (condition-case err
+        (make-process
+         :name buffer-name
+         :buffer buf
+         :command (cons program args)
+         :sentinel (lambda (_proc event)
+                     (when (string-match-p "\\`\\(finished\\|exited\\)"
+                                           event)
+                       (funcall on-done
+                                (string-match-p "\\`finished" event)))))
+      (error
+       (message "agent-shell-monome: could not launch %s: %S"
+                program err)
+       (funcall on-done nil)))))
+
 ;;; Arc: ring 4 (token momentum + effort control)
 ;;
 ;; The wheel is a flywheel spun by token usage across all known
@@ -2148,7 +2524,8 @@ its tiled view is active -- no pulse."
     (agent-shell-monome--render-permission-led
      (agent-shell-monome--allow-key-coord) pending)
     (agent-shell-monome--render-permission-led
-     (agent-shell-monome--reject-key-coord) pending)))
+     (agent-shell-monome--reject-key-coord) pending))
+  (agent-shell-monome--render-review-leds tick))
 
 (defun agent-shell-monome--render-permission-led (coord pending)
   "Paint the allow/reject hotkey LED at COORD.
@@ -2161,6 +2538,23 @@ buttons will actually do something."
    (if pending
        agent-shell-monome-level-blocked
      agent-shell-monome-level-idle)))
+
+(defun agent-shell-monome--render-review-leds (tick)
+  "Paint the review back/forward hotkeys based on `:review-state' at TICK.
+Idle: both dim.  Active: both steady bright, so the two-key pair is
+visibly `armed'.  During `:commit' with a live recording, the forward
+key pulses at the busy cadence to make the mic state unmistakable
+(same signal as a buffer key being dictated into)."
+  (let* ((state (agent-shell-monome--review-state))
+         (back (agent-shell-monome--review-back-key-coord))
+         (fwd (agent-shell-monome--review-forward-key-coord))
+         (recording (alist-get :htt-recording agent-shell-monome--state))
+         (base (if state 15 agent-shell-monome-level-idle))
+         (fwd-level (if (and (eq state :commit) recording)
+                        (if (< (mod tick 4) 2) 15 0)
+                      base)))
+    (agent-shell-monome--set-grid-led (car back) (cdr back) base)
+    (agent-shell-monome--set-grid-led (car fwd) (cdr fwd) fwd-level)))
 
 (defun agent-shell-monome--render-interrupt-led ()
   "Paint the interrupt trigger LED to mirror the selected shell's status.
@@ -2286,11 +2680,17 @@ whether there is anything worth interrupting right by the trigger."
                 (cons :favorites-window nil)
                 ;; Bottom-row show-all toggle
                 (cons :show-all-window-config nil)
+                ;; Bottom-row magit review workflow
+                (cons :review-state nil)
+                (cons :review-repo-root nil)
+                (cons :review-magit-buffer nil)
+                (cons :review-commit-buffer nil)
                 ;; Hold-to-talk
                 (cons :htt-down-coord nil)
                 (cons :htt-timer nil)
                 (cons :htt-recording nil)
                 (cons :htt-target nil)
+                (cons :htt-plain-insert nil)
                 (cons :htt-somafm-ducked nil)))
     (setq agent-shell-permission-responder-function
           #'agent-shell-monome--responder)
