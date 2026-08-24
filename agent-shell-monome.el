@@ -58,6 +58,15 @@
 ;;   without pressing a buffer key is a safe cancel.  The delete key is
 ;;   drawn dim when idle and pulses bright while held.
 ;;
+;;   The key immediately left of delete is the "favorites" hotkey.  Hold
+;;   it and a picker buffer pops up listing
+;;   `agent-shell-monome-favorite-projects'; the scroll encoder (see
+;;   `agent-shell-monome-arc-scroll-encoder') moves the selection while
+;;   held, and release starts a new agent-shell rooted at the selected
+;;   project.  Set favorites via
+;;   `M-x agent-shell-monome-set-favorite-projects', which reads from
+;;   projectile or built-in project.el's known-projects list.
+;;
 ;; Arc (uses the first 3 encoders):
 ;;   Ring 1 (selector) - one indicator LED per buffer at even spacing,
 ;;                       brightness reflects status, a brighter "pointer"
@@ -278,6 +287,31 @@ present together."
   "OSC address prefix configured on the arc at start."
   :type 'string)
 
+(defcustom agent-shell-monome-favorite-projects nil
+  "Directories reachable from the favorites hotkey (bottom row, left of delete).
+Each entry is an absolute directory path.  Set interactively via
+`agent-shell-monome-set-favorite-projects' (which persists the choice
+through `customize-save-variable') or `setq' it directly in your init."
+  :type '(repeat directory))
+
+(defcustom agent-shell-monome-favorites-encoder nil
+  "Encoder used to scroll the favorites picker while the hotkey is held.
+Nil (the default) reuses `agent-shell-monome-arc-scroll-encoder' -- the
+scroll dial doubles as the favorites dial while the picker is up, since
+scrolling a shell you are not currently looking at makes little sense.
+Set to an explicit encoder index to bind favorites to a dedicated dial."
+  :type '(choice (const :tag "Reuse scroll encoder" nil)
+                 integer))
+
+(defcustom agent-shell-monome-favorites-ticks-per-step 8
+  "Encoder ticks required to move the favorites picker by one entry."
+  :type 'integer)
+
+(defcustom agent-shell-monome-favorites-buffer-name
+  "*agent-shell-monome favorites*"
+  "Name of the buffer used to display favorite projects while held."
+  :type 'string)
+
 ;;; State
 
 (defvar agent-shell-monome--state nil
@@ -330,6 +364,17 @@ Top-level keys:
   :delete-key-down      - Non-nil while the bottom-right delete key is
                           physically held.  A buffer-key press during this
                           window kills that buffer instead of switching.
+
+  ;; Bottom-row favorites hotkey
+  :favorites-key-down          - Non-nil while the favorites hotkey (left
+                                 of delete) is physically held; the picker
+                                 buffer is up and the scroll encoder is
+                                 rerouted to it.
+  :favorites-index             - Selected entry in
+                                 `agent-shell-monome-favorite-projects'.
+  :favorites-scroll-accumulator - Encoder delta accumulator for the picker.
+  :favorites-window            - Window showing the picker buffer while
+                                 held; deleted on release.
 
   ;; Hold-to-talk (voice input via whisper)
   :htt-down-coord       - (X . Y) of the key whose hold gesture is active,
@@ -690,6 +735,15 @@ project when COL is nil or owns no project yet."
   "Return non-nil when (X, Y) is the delete hotkey coordinate."
   (equal (cons x y) (agent-shell-monome--delete-key-coord)))
 
+(defun agent-shell-monome--favorites-key-coord ()
+  "Return the (X . Y) of the favorites hotkey (immediately left of delete)."
+  (cons (- (or (alist-get :grid-width agent-shell-monome--state) 8) 2)
+        (agent-shell-monome--hotkey-row)))
+
+(defun agent-shell-monome--favorites-key-p (x y)
+  "Return non-nil when (X, Y) is the favorites hotkey coordinate."
+  (equal (cons x y) (agent-shell-monome--favorites-key-coord)))
+
 (defun agent-shell-monome--on-grid-key (x y state)
   "Handle a grid key event at (X, Y) with STATE (1=down, 0=up)."
   (if (= state 1)
@@ -705,14 +759,21 @@ already-open buffer so a tap (resolved on release) can submit an ENTER
 to it.
 
 The bottom row is reserved for hotkeys: the delete key (bottom-right)
-arms a kill gesture on press, and while it is held any buffer key press
-kills that buffer rather than switching to it.  Non-delete hotkey-row
-keys are currently ignored."
+arms a kill gesture on press, the favorites key (immediately left of
+delete) pops up the favorite-projects picker while held, and any other
+bottom-row key is a no-op for now."
   (cond
    ;; Delete key pressed: enter kill-arm mode.  Do not switch, spawn, or
    ;; arm hold-to-talk on the delete key itself.
    ((agent-shell-monome--delete-key-p x y)
     (setf (alist-get :delete-key-down agent-shell-monome--state) t))
+   ;; Favorites key pressed: open the picker.  The scroll encoder is
+   ;; rerouted to it (see `--on-enc-delta') while held.
+   ((agent-shell-monome--favorites-key-p x y)
+    (setf (alist-get :favorites-key-down agent-shell-monome--state) t)
+    (setf (alist-get :favorites-scroll-accumulator
+                     agent-shell-monome--state) 0)
+    (agent-shell-monome--show-favorites))
    ;; Other hotkey-row keys are reserved; no-op for now.
    ((agent-shell-monome--hotkey-row-p y)
     nil)
@@ -757,6 +818,152 @@ no live binding."
       (error (message "agent-shell-monome: delete failed: %S" err)))
     (agent-shell-monome--prune-bindings)))
 
+;;; Favorites hotkey (project picker)
+
+(defun agent-shell-monome--favorites-encoder ()
+  "Return the encoder index that steers the favorites picker."
+  (or agent-shell-monome-favorites-encoder
+      agent-shell-monome-arc-scroll-encoder))
+
+(defun agent-shell-monome--favorites-clamped-index ()
+  "Return `:favorites-index' clamped to the current favorites list.
+Returns 0 when the list is empty.  Clamping on read (rather than on
+write) means an out-of-date index survives the list shrinking under it."
+  (let ((n (length agent-shell-monome-favorite-projects)))
+    (if (zerop n)
+        0
+      (mod (or (alist-get :favorites-index agent-shell-monome--state) 0) n))))
+
+(defun agent-shell-monome--current-favorite ()
+  "Return the currently selected favorite project root, or nil.
+Nil when `agent-shell-monome-favorite-projects' is empty."
+  (when agent-shell-monome-favorite-projects
+    (nth (agent-shell-monome--favorites-clamped-index)
+         agent-shell-monome-favorite-projects)))
+
+(defun agent-shell-monome--favorite-label (root)
+  "Return a short label for project ROOT (basename of its directory)."
+  (let ((name (file-name-nondirectory
+               (directory-file-name (expand-file-name root)))))
+    (if (zerop (length name)) root name)))
+
+(defun agent-shell-monome--render-favorites-buffer ()
+  "Redraw the favorites picker buffer with the current selection highlighted.
+Return the buffer.  An empty favorites list is drawn as an instructional
+placeholder so the user knows how to populate one."
+  (let ((buffer (get-buffer-create agent-shell-monome-favorites-buffer-name)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (setq-local truncate-lines t)
+        (setq-local cursor-type nil)
+        (setq buffer-read-only t)
+        (if (null agent-shell-monome-favorite-projects)
+            (insert "No favorite projects yet.\n"
+                    "Run M-x agent-shell-monome-set-favorite-projects.")
+          (let ((index (agent-shell-monome--favorites-clamped-index))
+                (i 0))
+            (dolist (root agent-shell-monome-favorite-projects)
+              (let* ((label (agent-shell-monome--favorite-label root))
+                     (path (abbreviate-file-name root))
+                     (selected (= i index))
+                     (marker (if selected " ▶ " "   "))
+                     (line (format "%s%s  %s\n" marker label path)))
+                (insert (if selected
+                            (propertize line 'face 'highlight)
+                          line)))
+              (setq i (1+ i)))))))
+    buffer))
+
+(defun agent-shell-monome--show-favorites ()
+  "Pop up the favorites picker buffer without stealing focus."
+  (let ((buffer (agent-shell-monome--render-favorites-buffer)))
+    (setf (alist-get :favorites-window agent-shell-monome--state)
+          (display-buffer buffer
+                          '((display-buffer-pop-up-window)
+                            (inhibit-same-window . t)
+                            (window-height . fit-window-to-buffer))))))
+
+(defun agent-shell-monome--hide-favorites ()
+  "Close the favorites picker window, if it is still live."
+  (when-let* ((window (alist-get :favorites-window agent-shell-monome--state))
+              ((window-live-p window)))
+    (ignore-errors (delete-window window)))
+  (setf (alist-get :favorites-window agent-shell-monome--state) nil))
+
+(defun agent-shell-monome--favorites-on-delta (delta)
+  "Move the favorites picker by DELTA encoder ticks.
+Sub-`agent-shell-monome-favorites-ticks-per-step' motion accumulates in
+`:favorites-scroll-accumulator' so slow turns still eventually step.
+Wraps around the list.  A no-op when there are no favorites."
+  (when agent-shell-monome-favorite-projects
+    (let* ((acc (+ (or (alist-get :favorites-scroll-accumulator
+                                  agent-shell-monome--state) 0)
+                   delta))
+           (step (max 1 agent-shell-monome-favorites-ticks-per-step))
+           (n (length agent-shell-monome-favorite-projects))
+           (index (agent-shell-monome--favorites-clamped-index)))
+      (while (>= acc step)
+        (setq index (mod (1+ index) n))
+        (setq acc (- acc step)))
+      (while (<= acc (- step))
+        (setq index (mod (+ index n -1) n))
+        (setq acc (+ acc step)))
+      (setf (alist-get :favorites-index agent-shell-monome--state) index)
+      (setf (alist-get :favorites-scroll-accumulator
+                       agent-shell-monome--state) acc)
+      (agent-shell-monome--render-favorites-buffer))))
+
+(defun agent-shell-monome--spawn-shell-at (root)
+  "Start a new agent-shell rooted at ROOT.
+No-op when ROOT is nil or `agent-shell--new-shell' is unavailable."
+  (when (and root (fboundp 'agent-shell--new-shell))
+    (condition-case err
+        (let ((default-directory (file-name-as-directory
+                                  (expand-file-name root))))
+          (agent-shell--new-shell :location default-directory))
+      (error (message "agent-shell-monome: favorite spawn failed: %S" err)))))
+
+(defun agent-shell-monome--known-projects ()
+  "Return candidate project roots for the favorites picker.
+Prefer projectile's `projectile-known-projects' when available (that is
+what users tend to mean by \"recent projects\"), otherwise fall back to
+built-in project.el's `project-known-project-roots'.  Signal a
+user-error when neither source exists."
+  (cond
+   ((and (boundp 'projectile-known-projects) projectile-known-projects)
+    projectile-known-projects)
+   ((fboundp 'project-known-project-roots)
+    (project-known-project-roots))
+   (t
+    (user-error "No project source available; install projectile or use project.el"))))
+
+;;;###autoload
+(defun agent-shell-monome-set-favorite-projects ()
+  "Pick favorite projects from projectile/project.el's known-projects list.
+Prompts with `completing-read-multiple' (defaulted to the current set)
+and persists the choice via `customize-save-variable'.  The favorites
+hotkey reads from `agent-shell-monome-favorite-projects', so no restart
+is needed."
+  (interactive)
+  (let* ((candidates (mapcar #'abbreviate-file-name
+                             (agent-shell-monome--known-projects)))
+         (initial (mapcar #'abbreviate-file-name
+                          agent-shell-monome-favorite-projects))
+         (choices (completing-read-multiple
+                   "Favorite projects (comma-separated): "
+                   candidates nil nil
+                   (when initial (mapconcat #'identity initial ","))))
+         (expanded (mapcar (lambda (p)
+                             (file-name-as-directory (expand-file-name p)))
+                           choices)))
+    (customize-save-variable 'agent-shell-monome-favorite-projects expanded)
+    ;; Clamp the picker index so it stays inside the new list on the
+    ;; next render.
+    (when agent-shell-monome--state
+      (setf (alist-get :favorites-index agent-shell-monome--state) 0))
+    (message "Saved %d favorite project(s)" (length expanded))))
+
 (defun agent-shell-monome--on-grid-key-up (x y)
   "Handle a grid key release at (X, Y).
 Resolves the gesture armed on key-down.  A hold past the threshold stops
@@ -765,12 +972,19 @@ insertion.  A tap that began on the already-open buffer's own key submits
 an ENTER to it (see `agent-shell-monome-tap-open-sends-enter'); any other
 tap is just the buffer switch that already happened on key-down.
 
-Releasing the delete hotkey disarms the kill gesture.  Releases of keys
-pressed while delete was armed have no tap/hold state to resolve, since
-key-down took the kill branch and set none."
+Releasing the delete hotkey disarms the kill gesture.  Releasing the
+favorites hotkey closes the picker and spawns a new agent-shell rooted
+at the currently selected favorite (or does nothing when the list is
+empty).  Releases of keys pressed while a hotkey was armed have no
+tap/hold state to resolve, since key-down took the hotkey branch."
   (cond
    ((agent-shell-monome--delete-key-p x y)
     (setf (alist-get :delete-key-down agent-shell-monome--state) nil))
+   ((agent-shell-monome--favorites-key-p x y)
+    (let ((root (agent-shell-monome--current-favorite)))
+      (setf (alist-get :favorites-key-down agent-shell-monome--state) nil)
+      (agent-shell-monome--hide-favorites)
+      (agent-shell-monome--spawn-shell-at root)))
    ((agent-shell-monome--hotkey-row-p y)
     nil)
    (t
@@ -1079,8 +1293,14 @@ sent for ring N so an unchanged ring stays quiet."
 ;;; Arc: encoder dispatch
 
 (defun agent-shell-monome--on-enc-delta (n delta)
-  "Handle an encoder DELTA on encoder N."
+  "Handle an encoder DELTA on encoder N.
+While the favorites hotkey is held, the encoder that ordinarily steers
+scroll (`agent-shell-monome-arc-scroll-encoder' by default; overridable
+via `agent-shell-monome-favorites-encoder') is rerouted to the picker."
   (cond
+   ((and (alist-get :favorites-key-down agent-shell-monome--state)
+         (= n (agent-shell-monome--favorites-encoder)))
+    (agent-shell-monome--favorites-on-delta delta))
    ((= n agent-shell-monome-arc-selector-encoder)
     (agent-shell-monome--selector-on-delta delta))
    ((= n agent-shell-monome-arc-scroll-encoder)
@@ -1579,15 +1799,25 @@ while held, so the arm state is visible without needing to look away."
 
 (defun agent-shell-monome--render-hotkeys (tick)
   "Refresh the reserved hotkey row LEDs at TICK.
-Only the bottom-right delete key is drawn: dim (`agent-shell-monome-level-idle')
-when idle, pulsing bright while `:delete-key-down' is set."
-  (let ((coord (agent-shell-monome--delete-key-coord))
-        (armed (alist-get :delete-key-down agent-shell-monome--state)))
-    (agent-shell-monome--set-grid-led
-     (car coord) (cdr coord)
-     (if armed
-         (if (< (mod tick 4) 2) 15 8)
-       agent-shell-monome-level-idle))))
+The delete key (bottom-right) and the favorites key (immediately left
+of it) are drawn dim (`agent-shell-monome-level-idle') when idle and
+pulse bright while their respective armed flags are set."
+  (agent-shell-monome--render-hotkey-led
+   (agent-shell-monome--delete-key-coord)
+   (alist-get :delete-key-down agent-shell-monome--state)
+   tick)
+  (agent-shell-monome--render-hotkey-led
+   (agent-shell-monome--favorites-key-coord)
+   (alist-get :favorites-key-down agent-shell-monome--state)
+   tick))
+
+(defun agent-shell-monome--render-hotkey-led (coord armed tick)
+  "Paint a hotkey LED at COORD, pulsing at TICK when ARMED, else dim."
+  (agent-shell-monome--set-grid-led
+   (car coord) (cdr coord)
+   (if armed
+       (if (< (mod tick 4) 2) 15 8)
+     agent-shell-monome-level-idle)))
 
 (defun agent-shell-monome--render-arc ()
   "Refresh all arc rings from current state."
@@ -1678,6 +1908,11 @@ when idle, pulsing bright while `:delete-key-down' is set."
                 (cons :tap-reopen nil)
                 ;; Bottom-row delete hotkey
                 (cons :delete-key-down nil)
+                ;; Bottom-row favorites hotkey
+                (cons :favorites-key-down nil)
+                (cons :favorites-index 0)
+                (cons :favorites-scroll-accumulator 0)
+                (cons :favorites-window nil)
                 ;; Hold-to-talk
                 (cons :htt-down-coord nil)
                 (cons :htt-timer nil)
@@ -1710,6 +1945,7 @@ when idle, pulsing bright while `:delete-key-down' is set."
     (cancel-timer timer))
   (dolist (entry (alist-get :tokens-subscriptions agent-shell-monome--state))
     (agent-shell-monome--unsubscribe-tokens (car entry) (cdr entry)))
+  (ignore-errors (agent-shell-monome--hide-favorites))
   (ignore-errors (agent-shell-monome--clear-grid))
   (ignore-errors (agent-shell-monome--clear-arc))
   ;; Stop serialosc only after the clears above have been flushed to the

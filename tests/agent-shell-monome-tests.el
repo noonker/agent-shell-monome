@@ -852,34 +852,207 @@
       (agent-shell-monome--on-grid-key 0 3 0)
       (should-not (alist-get :delete-key-down agent-shell-monome--state)))))
 
+(defun agent-shell-monome-tests--last-level-for-coord (sent coord)
+  "Return the last brightness sent to grid COORD across SENT packets.
+SENT is a list of (ADDRESS . ((i . X) (i . Y) (i . LEVEL))) as recorded
+by the send-grid stub in these tests, most recent first."
+  (catch 'found
+    (dolist (packet sent)
+      (let ((args (cdr packet)))
+        (when (and (equal (car args) (cons 'i (car coord)))
+                   (equal (nth 1 args) (cons 'i (cdr coord))))
+          (throw 'found (cdr (nth 2 args))))))
+    nil))
+
 (ert-deftest agent-shell-monome--render-hotkeys-pulses-when-armed ()
-  ;; Rendering must always paint the delete key (dim when idle) and
-  ;; pulse it when :delete-key-down is set, so the arm state is visible.
+  ;; Both hotkeys draw dim when idle and pulse bright while their armed
+  ;; flags are set, so the user always sees the arm state without
+  ;; needing to look away from the grid.
   (let ((agent-shell-monome--state
          (list (cons :grid-width 4)
                (cons :grid-height 4)
                (cons :grid-prefix "/monome-grid")
                (cons :last-leds nil)
-               (cons :delete-key-down nil)))
+               (cons :delete-key-down nil)
+               (cons :favorites-key-down nil)))
         (agent-shell-monome-level-idle 2)
         (sent nil))
     (cl-letf (((symbol-function 'agent-shell-monome--send-grid)
                (lambda (address args) (push (cons address args) sent))))
-      ;; Idle: draw at level-idle.
+      ;; Idle: both hotkeys at level-idle.
       (agent-shell-monome--render-hotkeys 0)
-      (should (equal '((i . 3) (i . 3) (i . 2))
-                     (cdr (car sent))))
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 3 3))))
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 2 3))))
       (setq sent nil)
-      ;; Armed on the bright half of the pulse.
+      ;; Delete armed, favorites idle: only delete pulses.
       (setf (alist-get :delete-key-down agent-shell-monome--state) t)
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
       (agent-shell-monome--render-hotkeys 0)
-      (should (equal '((i . 3) (i . 3) (i . 15))
-                     (cdr (car sent))))
+      (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                     sent (cons 3 3))))
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 2 3))))
       (setq sent nil)
-      ;; Armed on the dim half of the pulse (tick 2 out of 4).
+      ;; Favorites armed, delete idle: only favorites pulses.
+      (setf (alist-get :delete-key-down agent-shell-monome--state) nil)
+      (setf (alist-get :favorites-key-down agent-shell-monome--state) t)
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
+      (agent-shell-monome--render-hotkeys 0)
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 3 3))))
+      (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                     sent (cons 2 3))))
+      (setq sent nil)
+      ;; Dim half of the pulse (tick 2 of 4) for the armed favorites key.
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
       (agent-shell-monome--render-hotkeys 2)
-      (should (equal '((i . 3) (i . 3) (i . 8))
-                     (cdr (car sent)))))))
+      (should (= 8 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 2 3)))))))
+
+;;;; Favorites hotkey (project picker)
+
+(ert-deftest agent-shell-monome--favorites-key-coord-left-of-delete ()
+  ;; The favorites key must be exactly one column left of the delete
+  ;; key on the reserved hotkey row, regardless of grid size.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 8) (cons :grid-height 8))))
+    (should (equal (cons 6 7) (agent-shell-monome--favorites-key-coord)))
+    (should (agent-shell-monome--favorites-key-p 6 7))
+    (should-not (agent-shell-monome--favorites-key-p 7 7))
+    (should-not (agent-shell-monome--favorites-key-p 6 6))))
+
+(ert-deftest agent-shell-monome--favorites-key-shows-picker ()
+  ;; Pressing the favorites key must open the picker (via display-buffer)
+  ;; and mark the key as held.  It must not switch, spawn, or arm hold.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :bindings nil)
+               (cons :favorites-key-down nil)
+               (cons :favorites-index 0)
+               (cons :favorites-scroll-accumulator 5)
+               (cons :favorites-window nil)))
+        (agent-shell-monome-favorite-projects '("/proj/a/" "/proj/b/"))
+        (displayed nil))
+    (cl-letf (((symbol-function 'display-buffer)
+               (lambda (buf &rest _) (setq displayed buf) 'fake-window))
+              ((symbol-function 'window-live-p) (lambda (_) nil))
+              ((symbol-function 'pop-to-buffer)
+               (lambda (&rest _) (error "favorites key must not switch"))))
+      (agent-shell-monome--on-grid-key-down 2 3)
+      (should (alist-get :favorites-key-down agent-shell-monome--state))
+      (should (bufferp displayed))
+      (should (eq 'fake-window
+                  (alist-get :favorites-window agent-shell-monome--state)))
+      ;; Accumulator reset each press, so an old value cannot leak an
+      ;; unexpected first step on the next turn.
+      (should (= 0 (alist-get :favorites-scroll-accumulator
+                              agent-shell-monome--state))))))
+
+(ert-deftest agent-shell-monome--favorites-scroll-steps-with-encoder ()
+  ;; Encoder deltas on the favorites encoder step the picker index once
+  ;; per `agent-shell-monome-favorites-ticks-per-step' ticks, wrapping.
+  (let ((agent-shell-monome--state
+         (list (cons :favorites-key-down t)
+               (cons :favorites-index 0)
+               (cons :favorites-scroll-accumulator 0)))
+        (agent-shell-monome-favorite-projects '("/a/" "/b/" "/c/"))
+        (agent-shell-monome-favorites-ticks-per-step 4)
+        (agent-shell-monome-arc-scroll-encoder 1)
+        (agent-shell-monome-arc-selector-encoder 0)
+        (agent-shell-monome-arc-decision-encoder 2)
+        (agent-shell-monome-arc-tokens-encoder 3))
+    (cl-letf (((symbol-function 'agent-shell-monome--render-favorites-buffer)
+               (lambda () nil)))
+      ;; Sub-step accumulates without moving.
+      (agent-shell-monome--on-enc-delta 1 2)
+      (should (= 0 (alist-get :favorites-index agent-shell-monome--state)))
+      ;; Cross the threshold: advance to entry 1.
+      (agent-shell-monome--on-enc-delta 1 2)
+      (should (= 1 (alist-get :favorites-index agent-shell-monome--state)))
+      ;; Two more full steps wraps 1 -> 2 -> 0.
+      (agent-shell-monome--on-enc-delta 1 8)
+      (should (= 0 (alist-get :favorites-index agent-shell-monome--state)))
+      ;; Negative deltas walk backwards, wrapping 0 -> 2.
+      (agent-shell-monome--on-enc-delta 1 -4)
+      (should (= 2 (alist-get :favorites-index agent-shell-monome--state))))))
+
+(ert-deftest agent-shell-monome--favorites-scroll-inactive-goes-to-shell ()
+  ;; When the favorites key is not held, the scroll encoder must reach
+  ;; the normal shell-scroll path -- not the favorites picker.
+  (let ((agent-shell-monome--state
+         (list (cons :favorites-key-down nil)
+               (cons :favorites-index 0)))
+        (agent-shell-monome-arc-scroll-encoder 1)
+        (agent-shell-monome-arc-selector-encoder 0)
+        (agent-shell-monome-arc-decision-encoder 2)
+        (agent-shell-monome-arc-tokens-encoder 3)
+        (scrolled nil))
+    (cl-letf (((symbol-function 'agent-shell-monome--scroll-on-delta)
+               (lambda (d) (setq scrolled d)))
+              ((symbol-function 'agent-shell-monome--favorites-on-delta)
+               (lambda (&rest _)
+                 (error "favorites route must not fire when key is up"))))
+      (agent-shell-monome--on-enc-delta 1 3)
+      (should (= 3 scrolled)))))
+
+(ert-deftest agent-shell-monome--favorites-release-spawns-and-closes ()
+  ;; On release: close the picker window, then spawn a new agent-shell
+  ;; rooted at the currently selected favorite.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :favorites-key-down t)
+               (cons :favorites-index 1)
+               (cons :favorites-window 'fake-window)))
+        (agent-shell-monome-favorite-projects '("/proj/a/" "/proj/b/"))
+        (deleted nil)
+        (spawned-at 'unset))
+    (cl-letf (((symbol-function 'window-live-p)
+               (lambda (w) (eq w 'fake-window)))
+              ((symbol-function 'delete-window)
+               (lambda (w) (setq deleted w)))
+              ((symbol-function 'agent-shell--new-shell)
+               (lambda (&rest args)
+                 (setq spawned-at (plist-get args :location)))))
+      (agent-shell-monome--on-grid-key-up 2 3)
+      (should-not (alist-get :favorites-key-down agent-shell-monome--state))
+      (should (eq deleted 'fake-window))
+      (should-not (alist-get :favorites-window agent-shell-monome--state))
+      ;; Spawned into favorite index 1 (/proj/b/).
+      (should (equal "/proj/b/" spawned-at)))))
+
+(ert-deftest agent-shell-monome--favorites-release-empty-list-noop ()
+  ;; An empty favorites list must not spawn on release, but must still
+  ;; disarm cleanly.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :favorites-key-down t)
+               (cons :favorites-index 0)
+               (cons :favorites-window nil)))
+        (agent-shell-monome-favorite-projects nil))
+    (cl-letf (((symbol-function 'agent-shell--new-shell)
+               (lambda (&rest _)
+                 (error "empty favorites list must not spawn")))
+              ((symbol-function 'window-live-p) (lambda (_) nil)))
+      (agent-shell-monome--on-grid-key-up 2 3)
+      (should-not (alist-get :favorites-key-down agent-shell-monome--state)))))
+
+(ert-deftest agent-shell-monome--current-favorite-clamps-index ()
+  ;; A stale :favorites-index past the list end must not crash or point
+  ;; past the last entry -- it clamps (modulo) into the list.
+  (let ((agent-shell-monome--state
+         (list (cons :favorites-index 99)))
+        (agent-shell-monome-favorite-projects '("/a/" "/b/" "/c/")))
+    (should (equal "/a/" (agent-shell-monome--current-favorite)))))
+
+(ert-deftest agent-shell-monome--current-favorite-nil-when-empty ()
+  (let ((agent-shell-monome--state (list (cons :favorites-index 0)))
+        (agent-shell-monome-favorite-projects nil))
+    (should-not (agent-shell-monome--current-favorite))))
 
 (provide 'agent-shell-monome-tests)
 ;;; agent-shell-monome-tests.el ends here
