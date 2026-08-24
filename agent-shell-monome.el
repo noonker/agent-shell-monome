@@ -81,6 +81,14 @@
 ;;   bright when blocked -- so it doubles as an at-a-glance "is there
 ;;   anything worth interrupting?" indicator right by the trigger.
 ;;
+;;   The two leftmost keys of the bottom row answer permission prompts
+;;   for the currently selected shell: bottom-left (x=0) allows, next
+;;   (x=1) rejects.  Both light up bright when the selected shell has a
+;;   pending prompt and are dim otherwise, so the pair is visually
+;;   silent unless there is something to answer.  Scoped to the selected
+;;   buffer for the same reason as ring 3: the physical keys must never
+;;   answer a prompt raised by an off-screen shell.
+;;
 ;; Arc (uses the first 3 encoders):
 ;;   Ring 1 (selector) - one indicator LED per buffer at even spacing,
 ;;                       brightness reflects status, a brighter "pointer"
@@ -805,6 +813,22 @@ project when COL is nil or owns no project yet."
   "Return non-nil when (X, Y) is the interrupt trigger coordinate."
   (equal (cons x y) (agent-shell-monome--interrupt-key-coord)))
 
+(defun agent-shell-monome--allow-key-coord ()
+  "Return the (X . Y) of the permission-allow hotkey (bottom-left)."
+  (cons 0 (agent-shell-monome--hotkey-row)))
+
+(defun agent-shell-monome--allow-key-p (x y)
+  "Return non-nil when (X, Y) is the permission-allow hotkey coordinate."
+  (equal (cons x y) (agent-shell-monome--allow-key-coord)))
+
+(defun agent-shell-monome--reject-key-coord ()
+  "Return the (X . Y) of the permission-reject hotkey (second from bottom-left)."
+  (cons 1 (agent-shell-monome--hotkey-row)))
+
+(defun agent-shell-monome--reject-key-p (x y)
+  "Return non-nil when (X, Y) is the permission-reject hotkey coordinate."
+  (equal (cons x y) (agent-shell-monome--reject-key-coord)))
+
 (defun agent-shell-monome--on-grid-key (x y state)
   "Handle a grid key event at (X, Y) with STATE (1=down, 0=up)."
   (if (= state 1)
@@ -824,8 +848,9 @@ arms a kill gesture on press, the favorites key (immediately left of
 delete) pops up the favorite-projects picker while held, the show-all
 key (third from the right) toggles a tiled view of every live
 agent-shell buffer, the interrupt key (fourth from the right) fires
-`agent-shell-interrupt' on the selected shell, and any other bottom-row
-key is a no-op for now."
+`agent-shell-interrupt' on the selected shell, the two leftmost keys
+answer the selected shell's oldest pending permission prompt (x=0
+allow, x=1 reject), and any other bottom-row key is a no-op for now."
   (cond
    ;; Delete key pressed: enter kill-arm mode.  Do not switch, spawn, or
    ;; arm hold-to-talk on the delete key itself.
@@ -845,6 +870,15 @@ key is a no-op for now."
    ;; request and reject any pending permissions there.
    ((agent-shell-monome--interrupt-key-p x y)
     (agent-shell-monome--interrupt-selected))
+   ;; Allow / reject hotkeys: answer the oldest pending permission for
+   ;; the selected buffer.  `--decide' no-ops when the queue is empty,
+   ;; so an accidental press with nothing waiting is harmless.  Scoped
+   ;; to the selected buffer for the same reason ring 3 is: the physical
+   ;; key must never answer a prompt raised by an off-screen shell.
+   ((agent-shell-monome--allow-key-p x y)
+    (agent-shell-monome--decide 'allow))
+   ((agent-shell-monome--reject-key-p x y)
+    (agent-shell-monome--decide 'reject))
    ;; Other hotkey-row keys are reserved; no-op for now.
    ((agent-shell-monome--hotkey-row-p y)
     nil)
@@ -2109,7 +2143,24 @@ its tiled view is active -- no pulse."
   (agent-shell-monome--render-hotkey-toggle-led
    (agent-shell-monome--show-all-key-coord)
    (alist-get :show-all-window-config agent-shell-monome--state))
-  (agent-shell-monome--render-interrupt-led))
+  (agent-shell-monome--render-interrupt-led)
+  (let ((pending (and (agent-shell-monome--pending-for-selected) t)))
+    (agent-shell-monome--render-permission-led
+     (agent-shell-monome--allow-key-coord) pending)
+    (agent-shell-monome--render-permission-led
+     (agent-shell-monome--reject-key-coord) pending)))
+
+(defun agent-shell-monome--render-permission-led (coord pending)
+  "Paint the allow/reject hotkey LED at COORD.
+Bright when PENDING is non-nil (the selected shell has a prompt these
+keys can answer), dim otherwise so the pair vanishes when there is
+nothing to respond to.  Mirrors ring 3's contract: only lights when the
+buttons will actually do something."
+  (agent-shell-monome--set-grid-led
+   (car coord) (cdr coord)
+   (if pending
+       agent-shell-monome-level-blocked
+     agent-shell-monome-level-idle)))
 
 (defun agent-shell-monome--render-interrupt-led ()
   "Paint the interrupt trigger LED to mirror the selected shell's status.

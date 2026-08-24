@@ -886,12 +886,13 @@
 
 (ert-deftest agent-shell-monome--non-delete-hotkey-row-key-is-noop ()
   ;; Other bottom-row keys are reserved for future hotkeys, so pressing
-  ;; one must not switch, spawn, or arm anything today.  Uses a 6-wide
-  ;; grid so there is a slot that is not claimed by any of the four
-  ;; existing right-side hotkeys (delete, favorites, show-all, interrupt).
+  ;; one must not switch, spawn, or arm anything today.  Uses an 8-wide
+  ;; grid so there is a slot in the middle that is not claimed by any
+  ;; existing hotkey (allow, reject, interrupt, show-all, favorites,
+  ;; delete).  Presses column 2 -- unclaimed on 8-wide.
   (let ((agent-shell-monome--state
          (list (cons :bindings nil)
-               (cons :grid-width 6)
+               (cons :grid-width 8)
                (cons :grid-height 4)
                (cons :delete-key-down nil)))
         (agent-shell-monome-spawn-on-empty-press t))
@@ -899,8 +900,8 @@
                (lambda (&rest _) (error "hotkey row must not spawn")))
               ((symbol-function 'pop-to-buffer)
                (lambda (&rest _) (error "hotkey row must not switch"))))
-      (agent-shell-monome--on-grid-key 0 3 1)
-      (agent-shell-monome--on-grid-key 0 3 0)
+      (agent-shell-monome--on-grid-key 2 3 1)
+      (agent-shell-monome--on-grid-key 2 3 0)
       (should-not (alist-get :delete-key-down agent-shell-monome--state)))))
 
 (defun agent-shell-monome-tests--last-level-for-coord (sent coord)
@@ -1225,8 +1226,10 @@ by the send-grid stub in these tests, most recent first."
 (ert-deftest agent-shell-monome--show-all-led-bright-when-active ()
   ;; Show-all's LED is dim (level-idle) when off and steadily bright when
   ;; on -- no pulse, since it is a toggle rather than a held modifier.
+  ;; Uses an 8-wide grid so show-all at (5, 3) doesn't collide with the
+  ;; permission keys sitting at (0, 3) / (1, 3).
   (let ((agent-shell-monome--state
-         (list (cons :grid-width 4)
+         (list (cons :grid-width 8)
                (cons :grid-height 4)
                (cons :grid-prefix "/monome-grid")
                (cons :last-leds nil)
@@ -1241,7 +1244,7 @@ by the send-grid stub in these tests, most recent first."
                (lambda () nil)))
       (agent-shell-monome--render-hotkeys 0)
       (should (= 2 (agent-shell-monome-tests--last-level-for-coord
-                    sent (cons 1 3))))
+                    sent (cons 5 3))))
       ;; Activate: the LED goes to full brightness on the very next
       ;; render, and stays there across tick phases (no pulse).
       (setf (alist-get :show-all-window-config
@@ -1250,12 +1253,12 @@ by the send-grid stub in these tests, most recent first."
       (setq sent nil)
       (agent-shell-monome--render-hotkeys 0)
       (should (= 15 (agent-shell-monome-tests--last-level-for-coord
-                     sent (cons 1 3))))
+                     sent (cons 5 3))))
       (setf (alist-get :last-leds agent-shell-monome--state) nil)
       (setq sent nil)
       (agent-shell-monome--render-hotkeys 2)
       (should (= 15 (agent-shell-monome-tests--last-level-for-coord
-                     sent (cons 1 3)))))))
+                     sent (cons 5 3)))))))
 
 ;;;; Hold-to-talk SomaFM ducking
 
@@ -1418,6 +1421,121 @@ by the send-grid stub in these tests, most recent first."
         (agent-shell-monome--render-interrupt-led)
         (should (= 15 (agent-shell-monome-tests--last-level-for-coord
                        sent (cons 0 3))))))))
+
+;;;; Permission hotkeys (bottom-left pair: allow / reject)
+
+(ert-deftest agent-shell-monome--permission-key-coords-are-leftmost ()
+  ;; The two leftmost columns of the hotkey row are reserved for
+  ;; permission answers: x=0 allow, x=1 reject.  Fixed by column, so
+  ;; they sit in the same spot regardless of grid width.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 16) (cons :grid-height 8))))
+    (should (equal (cons 0 7) (agent-shell-monome--allow-key-coord)))
+    (should (equal (cons 1 7) (agent-shell-monome--reject-key-coord)))
+    (should (agent-shell-monome--allow-key-p 0 7))
+    (should (agent-shell-monome--reject-key-p 1 7))
+    (should-not (agent-shell-monome--allow-key-p 1 7))
+    (should-not (agent-shell-monome--allow-key-p 0 6))))
+
+(ert-deftest agent-shell-monome--allow-key-answers-oldest-pending ()
+  ;; A tap on the allow key answers the selected shell's oldest pending
+  ;; prompt with its allow option; the reject key does the same with the
+  ;; reject option.  Uses an 8-wide grid so the two permission keys sit
+  ;; in truly unclaimed slots (no collision with right-side hotkeys).
+  (let* ((log nil)
+         (agent-shell-monome--state
+          (list (cons :grid-width 8)
+                (cons :grid-height 4)
+                (cons :bindings nil)
+                (cons :pending-permissions
+                      (list (list (cons :respond
+                                        (lambda (id) (push (cons 'fired id) log)))
+                                  (cons :allow-id "allow-1")
+                                  (cons :reject-id "reject-1")
+                                  (cons :buffer 'sel)))))))
+    (cl-letf (((symbol-function 'agent-shell-monome--selected-buffer)
+               (lambda () 'sel)))
+      (agent-shell-monome--on-grid-key-down 0 3)
+      (should (equal '(fired . "allow-1") (car log)))
+      (should-not (alist-get :pending-permissions agent-shell-monome--state))
+      ;; Requeue and try reject.
+      (setf (alist-get :pending-permissions agent-shell-monome--state)
+            (list (list (cons :respond
+                              (lambda (id) (push (cons 'fired id) log)))
+                        (cons :allow-id "allow-2")
+                        (cons :reject-id "reject-2")
+                        (cons :buffer 'sel))))
+      (agent-shell-monome--on-grid-key-down 1 3)
+      (should (equal '(fired . "reject-2") (car log))))))
+
+(ert-deftest agent-shell-monome--permission-keys-noop-without-pending ()
+  ;; Pressing allow / reject with nothing queued for the selected shell
+  ;; must be silent -- no error, no side effect.  A press with no
+  ;; selected buffer at all must also be a no-op (never answer an
+  ;; off-screen shell's prompt by accident).
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 8)
+               (cons :grid-height 4)
+               (cons :bindings nil)
+               (cons :pending-permissions nil))))
+    (cl-letf (((symbol-function 'agent-shell-monome--selected-buffer)
+               (lambda () nil)))
+      (agent-shell-monome--on-grid-key-down 0 3)
+      (agent-shell-monome--on-grid-key-down 1 3))
+    ;; With a selected buffer but nothing queued -- still silent.
+    (cl-letf (((symbol-function 'agent-shell-monome--selected-buffer)
+               (lambda () 'sel)))
+      (agent-shell-monome--on-grid-key-down 0 3)
+      (agent-shell-monome--on-grid-key-down 1 3))))
+
+(ert-deftest agent-shell-monome--permission-leds-bright-when-pending ()
+  ;; The two permission keys light bright when the selected shell has a
+  ;; pending prompt and stay at level-idle otherwise, so the pair is
+  ;; visually silent unless there is something to respond to.  Only the
+  ;; selected buffer's prompts count -- an off-screen shell's queued
+  ;; prompt must not trip the LEDs.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 8)
+               (cons :grid-height 4)
+               (cons :grid-prefix "/monome-grid")
+               (cons :last-leds nil)
+               (cons :delete-key-down nil)
+               (cons :favorites-key-down nil)
+               (cons :show-all-window-config nil)
+               (cons :pending-permissions nil)))
+        (agent-shell-monome-level-idle 2)
+        (agent-shell-monome-level-blocked 15)
+        (sent nil))
+    (cl-letf (((symbol-function 'agent-shell-monome--send-grid)
+               (lambda (address args) (push (cons address args) sent)))
+              ((symbol-function 'agent-shell-monome--selected-buffer)
+               (lambda () 'sel)))
+      ;; No pending: dim.
+      (agent-shell-monome--render-hotkeys 0)
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 0 3))))
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 1 3))))
+      ;; Foreign-buffer prompt: LEDs stay dim (dial-parity rule).
+      (setf (alist-get :pending-permissions agent-shell-monome--state)
+            (list (list (cons :buffer 'other))))
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
+      (setq sent nil)
+      (agent-shell-monome--render-hotkeys 0)
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 0 3))))
+      (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                    sent (cons 1 3))))
+      ;; Selected-buffer prompt: both keys bright.
+      (setf (alist-get :pending-permissions agent-shell-monome--state)
+            (list (list (cons :buffer 'sel))))
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
+      (setq sent nil)
+      (agent-shell-monome--render-hotkeys 0)
+      (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                     sent (cons 0 3))))
+      (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                     sent (cons 1 3)))))))
 
 (provide 'agent-shell-monome-tests)
 ;;; agent-shell-monome-tests.el ends here
