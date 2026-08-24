@@ -73,6 +73,14 @@
 ;;   to restore the exact window layout that was on screen before.  The
 ;;   key is dim when inactive and steadily bright while show-all is up.
 ;;
+;;   The key immediately left of show-all is the "interrupt" trigger.
+;;   Tap it to run `agent-shell-interrupt' on the currently selected
+;;   agent-shell buffer (with confirmation skipped, since a physical
+;;   grid press is already the confirmation).  The key mirrors the
+;;   selected shell's status LED -- dim when idle, pulsing while busy,
+;;   bright when blocked -- so it doubles as an at-a-glance "is there
+;;   anything worth interrupting?" indicator right by the trigger.
+;;
 ;; Arc (uses the first 3 encoders):
 ;;   Ring 1 (selector) - one indicator LED per buffer at even spacing,
 ;;                       brightness reflects status, a brighter "pointer"
@@ -94,6 +102,7 @@
 
 (declare-function agent-shell-buffers "agent-shell")
 (declare-function agent-shell-status "agent-shell" (&key shell-buffer))
+(declare-function agent-shell-interrupt "agent-shell" (&optional force))
 (declare-function agent-shell-subscribe-to "agent-shell")
 (declare-function agent-shell-unsubscribe "agent-shell")
 (declare-function agent-shell--state "agent-shell")
@@ -787,6 +796,15 @@ project when COL is nil or owns no project yet."
   "Return non-nil when (X, Y) is the show-all toggle coordinate."
   (equal (cons x y) (agent-shell-monome--show-all-key-coord)))
 
+(defun agent-shell-monome--interrupt-key-coord ()
+  "Return the (X . Y) of the interrupt trigger (fourth from bottom-right)."
+  (cons (- (or (alist-get :grid-width agent-shell-monome--state) 8) 4)
+        (agent-shell-monome--hotkey-row)))
+
+(defun agent-shell-monome--interrupt-key-p (x y)
+  "Return non-nil when (X, Y) is the interrupt trigger coordinate."
+  (equal (cons x y) (agent-shell-monome--interrupt-key-coord)))
+
 (defun agent-shell-monome--on-grid-key (x y state)
   "Handle a grid key event at (X, Y) with STATE (1=down, 0=up)."
   (if (= state 1)
@@ -805,7 +823,9 @@ The bottom row is reserved for hotkeys: the delete key (bottom-right)
 arms a kill gesture on press, the favorites key (immediately left of
 delete) pops up the favorite-projects picker while held, the show-all
 key (third from the right) toggles a tiled view of every live
-agent-shell buffer, and any other bottom-row key is a no-op for now."
+agent-shell buffer, the interrupt key (fourth from the right) fires
+`agent-shell-interrupt' on the selected shell, and any other bottom-row
+key is a no-op for now."
   (cond
    ;; Delete key pressed: enter kill-arm mode.  Do not switch, spawn, or
    ;; arm hold-to-talk on the delete key itself.
@@ -821,6 +841,10 @@ agent-shell buffer, and any other bottom-row key is a no-op for now."
    ;; Show-all key pressed: toggle tiled view of every agent-shell.
    ((agent-shell-monome--show-all-key-p x y)
     (agent-shell-monome--toggle-show-all))
+   ;; Interrupt key pressed: bail out of the selected shell's in-flight
+   ;; request and reject any pending permissions there.
+   ((agent-shell-monome--interrupt-key-p x y)
+    (agent-shell-monome--interrupt-selected))
    ;; Other hotkey-row keys are reserved; no-op for now.
    ((agent-shell-monome--hotkey-row-p y)
     nil)
@@ -864,6 +888,22 @@ no live binding."
           (kill-buffer buffer))
       (error (message "agent-shell-monome: delete failed: %S" err)))
     (agent-shell-monome--prune-bindings)))
+
+;;; Interrupt hotkey (bail out of the selected shell's turn)
+
+(defun agent-shell-monome--interrupt-selected ()
+  "Interrupt the currently selected agent-shell buffer.
+Calls `agent-shell-interrupt' with FORCE non-nil so the confirmation
+prompt is skipped -- the physical grid press is already the deliberate
+gesture, and a modal `y-or-n-p' popping up from the OSC filter would
+freeze the bridge until answered.  A no-op when no shell is selected."
+  (when-let* ((buffer (agent-shell-monome--selected-buffer))
+              ((buffer-live-p buffer))
+              ((fboundp 'agent-shell-interrupt)))
+    (condition-case err
+        (with-current-buffer buffer
+          (agent-shell-interrupt t))
+      (error (message "agent-shell-monome: interrupt failed: %S" err)))))
 
 ;;; Show-all hotkey (tile every agent-shell buffer)
 
@@ -2068,7 +2108,21 @@ its tiled view is active -- no pulse."
    tick)
   (agent-shell-monome--render-hotkey-toggle-led
    (agent-shell-monome--show-all-key-coord)
-   (alist-get :show-all-window-config agent-shell-monome--state)))
+   (alist-get :show-all-window-config agent-shell-monome--state))
+  (agent-shell-monome--render-interrupt-led))
+
+(defun agent-shell-monome--render-interrupt-led ()
+  "Paint the interrupt trigger LED to mirror the selected shell's status.
+Dim when nothing is selected or the selected shell is idle, pulsing at
+the busy cadence while it is working, full bright when it is blocked on
+a permission -- so the key doubles as an at-a-glance indicator of
+whether there is anything worth interrupting right by the trigger."
+  (let* ((coord (agent-shell-monome--interrupt-key-coord))
+         (buffer (agent-shell-monome--selected-buffer))
+         (level (if (and buffer (buffer-live-p buffer))
+                    (agent-shell-monome--level-for-buffer buffer)
+                  agent-shell-monome-level-idle)))
+    (agent-shell-monome--set-grid-led (car coord) (cdr coord) level)))
 
 (defun agent-shell-monome--render-hotkey-led (coord armed tick)
   "Paint a hotkey LED at COORD, pulsing at TICK when ARMED, else dim."

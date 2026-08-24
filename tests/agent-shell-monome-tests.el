@@ -886,10 +886,12 @@
 
 (ert-deftest agent-shell-monome--non-delete-hotkey-row-key-is-noop ()
   ;; Other bottom-row keys are reserved for future hotkeys, so pressing
-  ;; one must not switch, spawn, or arm anything today.
+  ;; one must not switch, spawn, or arm anything today.  Uses a 6-wide
+  ;; grid so there is a slot that is not claimed by any of the four
+  ;; existing right-side hotkeys (delete, favorites, show-all, interrupt).
   (let ((agent-shell-monome--state
          (list (cons :bindings nil)
-               (cons :grid-width 4)
+               (cons :grid-width 6)
                (cons :grid-height 4)
                (cons :delete-key-down nil)))
         (agent-shell-monome-spawn-on-empty-press t))
@@ -927,7 +929,12 @@ by the send-grid stub in these tests, most recent first."
         (agent-shell-monome-level-idle 2)
         (sent nil))
     (cl-letf (((symbol-function 'agent-shell-monome--send-grid)
-               (lambda (address args) (push (cons address args) sent))))
+               (lambda (address args) (push (cons address args) sent)))
+              ;; --render-hotkeys also paints the interrupt LED, which
+              ;; reads the selected buffer -- keep this test focused on
+              ;; the two pulsing hotkeys by stubbing that away.
+              ((symbol-function 'agent-shell-monome--selected-buffer)
+               (lambda () nil)))
       ;; Idle: both hotkeys at level-idle.
       (agent-shell-monome--render-hotkeys 0)
       (should (= 2 (agent-shell-monome-tests--last-level-for-coord
@@ -1229,7 +1236,9 @@ by the send-grid stub in these tests, most recent first."
         (agent-shell-monome-level-idle 2)
         (sent nil))
     (cl-letf (((symbol-function 'agent-shell-monome--send-grid)
-               (lambda (address args) (push (cons address args) sent))))
+               (lambda (address args) (push (cons address args) sent)))
+              ((symbol-function 'agent-shell-monome--selected-buffer)
+               (lambda () nil)))
       (agent-shell-monome--render-hotkeys 0)
       (should (= 2 (agent-shell-monome-tests--last-level-for-coord
                     sent (cons 1 3))))
@@ -1325,6 +1334,90 @@ by the send-grid stub in these tests, most recent first."
       (should (= 42 up))
       (should-not (alist-get :htt-somafm-ducked
                              agent-shell-monome--state)))))
+
+;;;; Interrupt hotkey (bail out of the selected shell's turn)
+
+(ert-deftest agent-shell-monome--interrupt-key-coord-fourth-from-right ()
+  ;; Interrupt lives one column left of show-all on the hotkey row, so
+  ;; the four right-side hotkeys (delete, favorites, show-all, interrupt)
+  ;; sit in that order counting from the far right.
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 16) (cons :grid-height 8))))
+    (should (equal (cons 12 7) (agent-shell-monome--interrupt-key-coord)))
+    (should (agent-shell-monome--interrupt-key-p 12 7))
+    (should-not (agent-shell-monome--interrupt-key-p 13 7))
+    (should-not (agent-shell-monome--interrupt-key-p 12 6))))
+
+(ert-deftest agent-shell-monome--interrupt-key-fires-on-selected ()
+  ;; A press on the interrupt key must run agent-shell-interrupt with
+  ;; FORCE non-nil (skipping the modal prompt), scoped to the selected
+  ;; buffer -- not to whatever buffer happens to be current when the
+  ;; OSC filter fires.  Uses a real buffer since `with-current-buffer'
+  ;; is a macro whose set-buffer call cannot be cl-letf'd.
+  (let ((buf (generate-new-buffer " *asm-interrupt-test*"))
+        (agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :bindings nil)))
+        (called-buf nil)
+        (called-force nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-monome--selected-buffer)
+                   (lambda () buf))
+                  ((symbol-function 'agent-shell-interrupt)
+                   (lambda (&optional force)
+                     (setq called-buf (current-buffer))
+                     (setq called-force force))))
+          (agent-shell-monome--on-grid-key-down 0 3)
+          (should (eq buf called-buf))
+          (should called-force))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest agent-shell-monome--interrupt-key-noop-without-selection ()
+  ;; With no selected shell, the trigger must not error and must not
+  ;; call agent-shell-interrupt (which would fail with "not in a shell"
+  ;; if invoked outside an agent-shell-mode buffer).
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4))))
+    (cl-letf (((symbol-function 'agent-shell-monome--selected-buffer)
+               (lambda () nil))
+              ((symbol-function 'agent-shell-interrupt)
+               (lambda (&rest _)
+                 (error "must not fire with no selected buffer"))))
+      (agent-shell-monome--on-grid-key-down 0 3))))
+
+(ert-deftest agent-shell-monome--interrupt-led-follows-selected-status ()
+  ;; The interrupt key's brightness mirrors the selected shell's status:
+  ;; dim when idle or unselected, bright when blocked (so it doubles as
+  ;; an at-a-glance "worth interrupting?" cue right by the trigger).
+  (let ((agent-shell-monome--state
+         (list (cons :grid-width 4)
+               (cons :grid-height 4)
+               (cons :grid-prefix "/monome-grid")
+               (cons :last-leds nil)))
+        (agent-shell-monome-level-idle 2)
+        (agent-shell-monome-level-blocked 15)
+        (sent nil))
+    (cl-letf (((symbol-function 'agent-shell-monome--send-grid)
+               (lambda (address args) (push (cons address args) sent))))
+      ;; No selected buffer -> dim.
+      (cl-letf (((symbol-function 'agent-shell-monome--selected-buffer)
+                 (lambda () nil)))
+        (agent-shell-monome--render-interrupt-led)
+        (should (= 2 (agent-shell-monome-tests--last-level-for-coord
+                      sent (cons 0 3)))))
+      (setq sent nil)
+      (setf (alist-get :last-leds agent-shell-monome--state) nil)
+      ;; Selected shell blocked -> full bright.
+      (cl-letf (((symbol-function 'agent-shell-monome--selected-buffer)
+                 (lambda () 'buf))
+                ((symbol-function 'buffer-live-p) (lambda (_) t))
+                ((symbol-function 'agent-shell-status)
+                 (lambda (&rest _) 'blocked)))
+        (agent-shell-monome--render-interrupt-led)
+        (should (= 15 (agent-shell-monome-tests--last-level-for-coord
+                       sent (cons 0 3))))))))
 
 (provide 'agent-shell-monome-tests)
 ;;; agent-shell-monome-tests.el ends here
